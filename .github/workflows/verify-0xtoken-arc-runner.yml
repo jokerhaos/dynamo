@@ -2,6 +2,7 @@ name: verify-0xtoken-arc-runner
 
 # Temporary verification workflow — proves the astro-web3 org ARC pool
 # `0xtoken-arc-runner-set` (prod/arc-systems in gitops-1xtoken) routes.
+# dyn-dynamo-prime (push2 to retrigger after dynamo went private — v2)
 # Safe to delete this file after the run is reviewed.
 on:
   pull_request:

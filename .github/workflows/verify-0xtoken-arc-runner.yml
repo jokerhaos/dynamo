@@ -1,0 +1,21 @@
+name: verify-0xtoken-arc-runner
+
+# Temporary verification workflow — proves the astro-web3 org ARC pool
+# `0xtoken-arc-runner-set` (prod/arc-systems in gitops-1xtoken) routes.
+# Safe to delete this file after the run is reviewed.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/verify-0xtoken-arc-runner.yml
+
+jobs:
+  ping:
+    runs-on: 0xtoken-arc-runner-set
+    steps:
+      - run: |
+          echo "hostname: $(hostname)"
+          echo "uname -a: $(uname -a)"
+          echo "RUNNER_NAME=${RUNNER_NAME:-unset}"
+          echo "RUNNER_LABELS=${RUNNER_LABELS:-unset}"
+          echo "GITHUB_JOB=${GITHUB_JOB:-unset}"
+          df -h /home/runner/_work 2>/dev/null || true

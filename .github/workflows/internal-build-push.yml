@@ -1,0 +1,527 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Internal build & push pipeline for a domestic-network-only self-hosted cluster.
+#
+# Runs on the in-cluster ARC runner set `0xtoken-arc-runner-set` and pushes the
+# rendered Dynamo image to the internal ZOT registry. Standalone — does not
+# depend on the upstream NVIDIA ECR / Azure ACR / prod-builder-v3 infra wired
+# into shared-build-image.yml.
+#
+# IMPORTANT — network assumption: the runner reaches domestic mirrors but NOT
+# foreign hosts (github.com / pypi.org / crates.io / static.rust-lang.org /
+# download.open-mpi.org / chromium.googlesource.com / ffmpeg.org / archive.ubuntu.com
+# / almalinux mirrors). Base OCI images (nvcr.io / docker.io / quay.io /
+# ghcr.io) are assumed to resolve transparently via the cluster's docker daemon
+# registry-mirror (configured outside this workflow). The inline `wget`/`git`/
+# `pip`/`cargo`/`apt`/`dnf` downloads inside the Dockerfile hit foreign hosts, so
+# after render we REWRITE rendered.Dockerfile to point every foreign source at a
+# domestic mirror (see the "Rewrite rendered Dockerfile for domestic mirrors"
+# step). One source we cannot reliably mirror today is ffmpeg.org — see the
+# note in that step.
+#
+# Repo settings to set once (Settings → Secrets and variables → Actions):
+#   Secrets:
+#     ZOT_USERNAME  - ZOT registry username (push auth)
+#     ZOT_PASSWORD  - ZOT registry password / token
+#   Variables (optional; defaults shown — override only if your cluster differs):
+#     ZOT_REGISTRY   = zot.orc-registry.svc.cluster.local:5000   (push target)
+#     ZOT_REPOSITORY = dynamo                                    (image namespace)
+#     GH_PROXY       = https://gh-proxy.com                      (github accelerator)
+#     RS_PROXY       = https://rsproxy.cn                        (cargo + rustup)
+#     APT_MIRROR     = mirrors.tuna.tsinghua.edu.cn              (ubuntu apt)
+#     DNF_MIRROR     = mirrors.aliyun.com                       (almalinux dnf; TUNA has no almalinux)
+#     PYPI_INDEX     = https://mirrors.aliyun.com/pypi/simple/         (TUNA 404s aisimulate, use aliyun)
+#     PYTORCH_MIRROR= https://mirrors.aliyun.com/pytorch-wheels/
+#
+# The ZOT registry is served over plain HTTP on :5000, so the buildkit builder
+# is created with an insecure (http=true, insecure=true) registry block and
+# credentials are written directly to ~/.docker/config.json (bypassing
+# `docker login`, which would otherwise attempt an HTTPS handshake and fail).
+
+name: Internal Build & Push
+
+on:
+  # Auto-build on push to main. `inputs.*` are empty under a push event, so
+  # the job reads them through `inputs.X || <default>` fallbacks and builds
+  # the default variant — `sglang-runtime-cuda13` (framework=sglang,
+  # target=runtime), the in-house equivalent of nvcr.io's
+  # ai-dynamo/sglang-runtime-nightly image (same upstream Dockerfile, same
+  # ENTRYPOINT). Drop-in production replacement: switch the deployment's
+  # image from `nvcr.io/nvidia/ai-dynamo/sglang-runtime-nightly@sha256:...` to
+  # `orc.../sglang-runtime-cuda13:main` and leave everything else
+  # (command/args/env) the same. Use workflow_dispatch for any other
+  # framework/target (e.g. dev/local-dev for an interactive-tooled image).
+  push:
+    branches: [main]
+    paths:
+      - 'container/**'
+      - 'components/**'
+      - 'lib/**'
+      - 'deploy/**'
+      - 'scripts/**'
+      - '.github/workflows/internal-build-push.yml'
+  workflow_dispatch:
+    inputs:
+      framework:
+        description: 'Framework to render/build (dynamo, vllm, sglang, trtllm)'
+        required: true
+        type: choice
+        default: 'sglang'
+        options:
+          - dynamo
+          - vllm
+          - sglang
+          - trtllm
+      target:
+        description: 'Dockerfile build target stage (runtime, dev, local-dev, frontend, planner)'
+        required: true
+        type: choice
+        default: 'runtime'
+        options:
+          - runtime
+          - dev
+          - local-dev
+          - frontend
+          - planner
+      device:
+        description: 'Device arch (cuda needs a cuda_version; cpu/xpu do not)'
+        required: true
+        type: choice
+        default: 'cuda'
+        options:
+          - cuda
+          - cpu
+          - xpu
+      cuda_version:
+        description: 'CUDA version (13.0 for vllm/sglang, 13.1 for trtllm). Leave empty for cpu/xpu.'
+        required: false
+        type: string
+        default: '13.0'
+      platform:
+        description: 'Target platform(s), Docker-style (e.g. linux/amd64 or linux/amd64,linux/arm64)'
+        required: true
+        type: string
+        default: 'linux/amd64'
+      no_cache:
+        description: 'Disable Docker build cache (force fresh layers)'
+        required: false
+        type: boolean
+        default: false
+      make_efa:
+        description: 'Enable AWS EFA support (only meaningful for some cuda builds)'
+        required: false
+        type: boolean
+        default: false
+      extra_build_args:
+        description: 'Extra `--build-arg KEY=VALUE` lines, newline-separated, passed to docker buildx build'
+        required: false
+        type: string
+        default: ''
+
+# Avoid duplicate concurrent builds of the same variant on the same ref — let
+# the in-flight one finish (image tags are SHA-keyed, a cancelled push can
+# leave a half-pushed tag).
+concurrency:
+  group: internal-build-${{ github.ref }}-${{ github.event.inputs.framework || 'sglang' }}-${{ github.event.inputs.target || 'runtime' }}-${{ github.event.inputs.cuda_version || '13.0' }}
+  cancel-in-progress: false
+
+env:
+  # ZOT push target + image namespace.
+  ZOT_REGISTRY: ${{ vars.ZOT_REGISTRY != '' && vars.ZOT_REGISTRY || 'zot.orc-registry.svc.cluster.local:5000' }}
+  ZOT_REPOSITORY: ${{ vars.ZOT_REPOSITORY != '' && vars.ZOT_REPOSITORY || 'dynamo' }}
+  # Domestic mirrors the rewrite step points foreign sources at. All overridable
+  # via repo Variables so a mirror swap is a one-line change, not a code edit.
+  GH_PROXY: ${{ vars.GH_PROXY != '' && vars.GH_PROXY || 'https://gh-proxy.com' }}
+  RS_PROXY: ${{ vars.RS_PROXY != '' && vars.RS_PROXY || 'https://rsproxy.cn' }}
+  APT_MIRROR: ${{ vars.APT_MIRROR != '' && vars.APT_MIRROR || 'mirrors.tuna.tsinghua.edu.cn' }}
+  DNF_MIRROR: ${{ vars.DNF_MIRROR != '' && vars.DNF_MIRROR || 'mirrors.aliyun.com' }}
+  # PyPI index. Aliyun (not TUNA): aisimulate (an ai-dynamo 1.5.0 dep) was
+  # published 2026-08-14, and TUNA's mirror returns 404 for the whole package,
+  # so the build's pip/uv resolver can't reach it via TUNA. Aliyun mirrors
+  # aisimulate including its dev pre-releases (0.1.0.dev1). This feed the
+  # render-deps uv install AND the docker build's pip/uv secret
+  # (UV_DEFAULT_INDEX / PIP_INDEX_URL).
+  PYPI_INDEX: ${{ vars.PYPI_INDEX != '' && vars.PYPI_INDEX || 'https://mirrors.aliyun.com/pypi/simple/' }}
+  # PyTorch wheel index (dynamo framework installs torch via
+  # `--extra-index-url https://download.pytorch.org/whl/cuXXX`). Aliyun mirrors
+  # download.pytorch.org/whl/<cuXXX> with the same PEP503 layout.
+  PYTORCH_MIRROR: ${{ vars.PYTORCH_MIRROR != '' && vars.PYTORCH_MIRROR || 'https://mirrors.aliyun.com/pytorch-wheels/' }}
+  # Base-image overrides → pre-mirrored into orc.0xtoken.cn (the runner can't
+  # reach nvcr.io/quay.io/ghcr.io; those images are pulled once on a host with
+  # internet and pushed here). cuda-dl-base keeps its framework/cuda-specific
+  # BASE_IMAGE_TAG, so this is the image *path* only (no tag). WHEEL_BUILDER and
+  # UV carry their tag (manylinux isn't pinned upstream, so use a concrete tag).
+  BASE_IMAGE_REF: ${{ vars.BASE_IMAGE_REF != '' && vars.BASE_IMAGE_REF || 'orc.0xtoken.cn/dynamo/cuda-dl-base' }}
+  WHEEL_BUILDER_IMAGE_REF: ${{ vars.WHEEL_BUILDER_IMAGE_REF != '' && vars.WHEEL_BUILDER_IMAGE_REF || 'orc.0xtoken.cn/dynamo/manylinux228-amd64:2026-09-01' }}
+  UV_IMAGE_REF: ${{ vars.UV_IMAGE_REF != '' && vars.UV_IMAGE_REF || 'orc.0xtoken.cn/dynamo/uv:0.12.0' }}
+
+jobs:
+  build-push:
+    runs-on: 0xtoken-arc-runner-set
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      # Checkout: a shared partial-clone mirror under /cache/repos is reused
+      # across runs — only the new commit's tiny delta is fetched each time, and
+      # the work tree is cloned LOCALLY from that mirror (no 2nd github trip).
+      # No mirror yet → fresh partial clone (one-time, then cached). One job per
+      # ARC runner → no mirror lock. github is pulled through a domestic gh-proxy
+      # with the job-scoped GITHUB_TOKEN in the URL userinfo (gh-proxy forwards
+      # Basic auth upstream; the token is contents:read + expires when the job
+      # ends — low-leak, user-approved). cone omits docs/ benchmarks/ skills/.
+      - name: Checkout (cached shallow mirror + local copy)
+        shell: bash
+        env:
+          GH_PROXY: ${{ env.GH_PROXY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPARSE: container components lib deploy tests examples dev recipes .cargo scripts
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          # Clone straight from github.com with the job token (basic auth).
+          # The runner already reaches github.com (it polls the Actions API),
+          # and token-authenticated git is NOT rate-limited, so on-demand blob
+          # fetches from a partial clone won't 403. Routing this through
+          # gh-proxy does (it 403s git-upload-pack intermittently with
+          # "Web page content is not allowed" — fine for release-asset wgets,
+          # not for git clone). Partial shallow clone (--filter=blob:none):
+          # the initial clone + each per-commit fetch carry only commit+tree
+          # objects; blobs are fetched on-demand by checkout as many small
+          # per-blob pack requests through the same URL.
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          MIRROR="/cache/repos/${GITHUB_REPOSITORY}"
+          retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 --filter=blob:none "$url" "$MIRROR"; }
+          fetch_sha(){ git -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
+          direct_clone(){ git clone --no-tags --depth 1 --filter=blob:none --no-checkout "$url" . && git sparse-checkout init --cone && git sparse-checkout set $SPARSE && git checkout -f "$GITHUB_SHA"; }
+
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            mkdir -p "$(dirname "$MIRROR")"
+            # Re-seed when the mirror (or this checkout version's marker) is absent.
+            # A marker (not partialclonefilter config) is the gate: older checkout
+            # versions removed origin on re-add, dropping that config and leaving a
+            # partially-populated object store that then fails full-blob checkouts.
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}.seed-v3"
+            if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
+              echo "::notice::(re)seeding mirror — one-time full shallow clone via gh-proxy"
+              retry seed || { echo "::error::mirror seed failed"; exit 1; }
+              : > "$MARK"
+            fi
+            # Refresh origin's URL with THIS run's token every run. GITHUB_TOKEN is
+            # job-scoped + short-lived, and a clone from an earlier run left an
+            # expired one in remote.origin.url → 'Authentication failed' on fetch.
+            # set-url preserves remote.origin.{partialclonefilter,promisor} config.
+            git -C "$MIRROR" remote set-url origin "$url"
+            git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
+            git -C "$MIRROR" sparse-checkout set $SPARSE
+            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
+            # work tree = a local copy of the mirror's checked-out tree. .git is
+            # kept so later steps can `git rev-parse`; .dockerignore drops it from
+            # the docker build context.
+            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+          else
+            echo "no /cache/repos volume — direct shallow clone via gh-proxy"
+            cd "$GITHUB_WORKSPACE"
+            retry direct_clone || { echo "::error::repo clone/checkout failed"; exit 1; }
+          fi
+          cd "$GITHUB_WORKSPACE"
+          git clean -fdxq
+          echo "checked out ${GITHUB_SHA:0:7}"
+
+
+
+
+      - name: Install render.py dependencies
+        shell: bash
+        env:
+          GH_PROXY: ${{ env.GH_PROXY }}
+          PYPI_INDEX: ${{ env.PYPI_INDEX }}
+        run: |
+          set -ueo pipefail
+          # render.py needs pyyaml + jinja2. The runner's python3 has NO pip and
+          # NO uv ("No module named pip"), and the host package manager reaches
+          # only foreign apt. Bootstrap a static `uv` binary from its GitHub
+          # release via the domestic gh-proxy (public repo astral-sh/uv, no
+          # token), then use uv to install the two deps from the domestic PyPI
+          # mirror. uv is a single ~10MB tarball — well under the RST window.
+          case "$(uname -m)" in
+            x86_64)  UV_ASSET="uv-x86_64-unknown-linux-gnu.tar.gz" ;;
+            aarch64) UV_ASSET="uv-aarch64-unknown-linux-gnu.tar.gz" ;;
+            *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;;
+          esac
+          UV_TAG="0.12.8"
+          UV_URL="${GH_PROXY}/https://github.com/astral-sh/uv/releases/download/${UV_TAG}/${UV_ASSET}"
+          mkdir -p "$HOME/.local/bin"
+          ok=0
+          for i in $(seq 1 20); do
+            echo "fetching uv ${UV_TAG} (attempt ${i}/20)"
+            if curl -fL --connect-timeout 20 --max-time 120 -o /tmp/uv.tgz "$UV_URL"; then
+              ok=1; break
+            fi
+            echo "::warning::uv download ${i}/20 failed; retry in 3s"
+            sleep 3
+          done
+          [ $ok -eq 1 ] || { echo "::error::failed to download uv after 20 attempts"; exit 1; }
+          tar -xzf /tmp/uv.tgz -C /tmp
+          install -m 0755 /tmp/uv-*/uv "$HOME/.local/bin/uv"
+          export PATH="$HOME/.local/bin:$PATH"
+          uv --version
+          # Probe the domestic index first so the log shows whether tuna is
+          # reachable and serving pyyaml from this runner's network.
+          curl -fsS --connect-timeout 10 -o /dev/null \
+            -w "pyidx probe: tuna/PyYAML -> HTTP %{http_code}\n" \
+            "$PYPI_INDEX/pyyaml/" \
+            || echo "pyidx probe: tuna PyYAML unreachable or non-200"
+          # Install into a user-writable venv (the runner runs as a non-root
+          # user, so --system into /usr/local/lib is Permission denied). Put the
+          # venv bin on GITHUB_PATH so later steps' `python3` runs the venv
+          # python that has pyyaml+jinja2.
+          VENV="$HOME/dynamo-render-venv"
+          uv venv "$VENV"
+          export VIRTUAL_ENV="$VENV"
+          export PATH="$VENV/bin:$PATH"
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          uv pip install --default-index "$PYPI_INDEX" pyyaml jinja2
+          python3 -c "import yaml, jinja2; print('render deps OK')"
+
+      - name: Compute image tags
+        id: tag
+        shell: bash
+        env:
+          FRAMEWORK: ${{ inputs.framework || 'sglang' }}
+          TARGET: ${{ inputs.target || 'runtime' }}
+          CUDA_VERSION: ${{ github.event_name == 'push' && '13.0' || inputs.cuda_version }}
+        run: |
+          set -ueo pipefail
+          SHA="$(git rev-parse --short=12 HEAD)"
+          : "${SHA:=${GITHUB_SHA::12}}"
+          REF="${GITHUB_REF_NAME}"
+          SAFE_REF="$(printf '%s' "${REF}" | tr -c 'a-zA-Z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
+          [ -z "${SAFE_REF}" ] && SAFE_REF="commit"
+
+          TAG_NAME="${FRAMEWORK}-${TARGET}"
+          if [ -n "${CUDA_VERSION}" ]; then
+            TAG_NAME="${TAG_NAME}-cuda$(printf '%s' "${CUDA_VERSION}" | cut -d. -f1)"
+          fi
+
+          echo "name=${TAG_NAME}"             >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${TAG_NAME}:${SHA}"   >> "$GITHUB_OUTPUT"
+          echo "ref_tag=${TAG_NAME}:${SAFE_REF}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"                   >> "$GITHUB_OUTPUT"
+
+      - name: Render Dockerfile
+        id: render
+        shell: bash
+        env:
+          FRAMEWORK: ${{ inputs.framework || 'sglang' }}
+          TARGET: ${{ inputs.target || 'runtime' }}
+          PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+          CUDA_VERSION: ${{ github.event_name == 'push' && '13.0' || inputs.cuda_version }}
+          DEVICE: ${{ inputs.device || 'cuda' }}
+          MAKE_EFA: ${{ inputs.make_efa || 'false' }}
+        run: |
+          set -ueo pipefail
+          ARGS=(python3 ./container/render.py
+                --framework="${FRAMEWORK}"
+                --target="${TARGET}"
+                --platform="${PLATFORM}"
+                --output-short-filename)
+
+          if [ "${DEVICE}" = "cuda" ] && [ -n "${CUDA_VERSION}" ]; then
+            ARGS+=(--device=cuda --cuda-version="${CUDA_VERSION}")
+          else
+            ARGS+=(--device="${DEVICE}")
+          fi
+          if [ "${MAKE_EFA}" = "true" ]; then
+            ARGS+=(--make-efa)
+          fi
+
+          echo "+ ${ARGS[*]}"
+          "${ARGS[@]}"
+
+          test -s container/rendered.Dockerfile
+          echo "dockerfile=container/rendered.Dockerfile" >> "$GITHUB_OUTPUT"
+          echo "framework=${FRAMEWORK}" >> "$GITHUB_OUTPUT"
+          echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "device=${DEVICE}" >> "$GITHUB_OUTPUT"
+          echo "cuda_version=${CUDA_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify image identity
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+          RENDER_FRAMEWORK: ${{ steps.render.outputs.framework }}
+          RENDER_TARGET: ${{ steps.render.outputs.target }}
+          RENDER_DEVICE: ${{ steps.render.outputs.device }}
+          RENDER_CUDA_VERSION: ${{ steps.render.outputs.cuda_version }}
+        run: |
+          set -ueo pipefail
+          if [ "${RENDER_DEVICE}" = "cuda" ] && [ -z "${RENDER_CUDA_VERSION}" ]; then
+            echo "::error::CUDA builds require cuda_version"
+            exit 1
+          fi
+          if [ "${RENDER_DEVICE}" != "cuda" ] && [ -n "${RENDER_CUDA_VERSION}" ]; then
+            echo "::error::${RENDER_DEVICE} builds must not set cuda_version"
+            exit 1
+          fi
+          EXPECTED_NAME="${RENDER_FRAMEWORK}-${RENDER_TARGET}"
+          if [ -n "${RENDER_CUDA_VERSION}" ]; then
+            EXPECTED_NAME="${EXPECTED_NAME}-cuda$(printf '%s' "${RENDER_CUDA_VERSION}" | cut -d. -f1)"
+          fi
+          if [ "${TAG_NAME}" != "${EXPECTED_NAME}" ]; then
+            echo "::error::image tag ${TAG_NAME} does not match rendered variant ${EXPECTED_NAME}"
+            exit 1
+          fi
+
+      - name: Rewrite rendered Dockerfile for domestic mirrors
+        shell: bash
+        # The rewrite reads GH_PROXY / RS_PROXY / APT_MIRROR / DNF_MIRROR /
+        # PYTORCH_MIRROR / BASE_IMAGE_REF / WHEEL_BUILDER_IMAGE_REF /
+        # UV_IMAGE_REF (all inherited from the top-level env block) and the
+        # optional BUILD_PROXY repo Variable. Python git-clone goes anonymous
+        # so the per-run GITHUB_TOKEN no longer rotates the build cache keys.
+        env:
+          BUILD_PROXY: ${{ vars.BUILD_PROXY }}
+        run: |
+          set -ueo pipefail
+          DF="container/rendered.Dockerfile"
+
+          echo "::group::foreign hosts BEFORE rewrite"
+          grep -oE 'https?://[a-zA-Z0-9./_-]+' "$DF" | sort -u \
+            | grep -Ev 'gh-proxy\.com|rsproxy\.cn|mirrors\.tuna|github\.com/ai-dynamo|nvcr\.io|quay\.io|ghcr\.io' \
+            || true
+          echo "::endgroup::"
+
+          # Mirror rewriting (github->gh-proxy, pypi/rustup/pytorch->domestic
+          # mirrors, base images->orc, git-clone retry-wrap, apt/dnf mirror
+          # swap) lives in scripts/render_dockerfile_cn.py so this step stays a
+          # thin layer; see its module docstring for the full host table.
+          python3 scripts/render_dockerfile_cn.py "$DF"
+
+          echo "::group::rendered Dockerfile (head after rewrite)"
+          sed -n '1,60p' "$DF"
+          echo "::endgroup::"
+
+          # Non-fatal expectations about sources we did NOT rewrite (no reliable
+          # public domestic mirror exists).
+          # ffmpeg.org: build relies on the runner reaching it directly; a build
+          #   failing at the ffmpeg download means that broke (proxy it then).
+          # pypi.nvidia.com: trtllm-only; dynamo/vllm/sglang builds do not hit it.
+          if grep -q 'https://ffmpeg.org' "$DF"; then
+            echo "::notice::ffmpeg.org left in-Dockerfile (no public domestic mirror). Build relies on the runner reaching ffmpeg.org directly. If a build fails at the ffmpeg download, proxy ffmpeg.org via an internal mirror and add a rewrite."
+          fi
+          if grep -q 'pypi.nvidia.com' "$DF"; then
+            echo "::warning::pypi.nvidia.com remains (trtllm only) — no public domestic mirror; trtllm builds will fail fetching NVIDIA python packages. dynamo/vLLM/SGLang builds do not hit it."
+          fi
+
+      - name: Export pod env to GITHUB env
+        shell: bash
+        run: |
+          # The ARC runner pod exposes the cluster's remote buildkitd endpoint
+          # (and only that) as an env var. Surface it for docker/setup-buildx-action.
+          echo "BUILDKIT_HOST=${BUILDKIT_HOST}" >> "$GITHUB_ENV"
+
+      - name: Configure ZOT registry credentials
+        shell: bash
+        env:
+          ZOT_REGISTRY: ${{ env.ZOT_REGISTRY }}
+          ZOT_USERNAME: ${{ secrets.ZOT_USERNAME }}
+          ZOT_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+        run: |
+          set -ueo pipefail
+          if [ -z "${ZOT_USERNAME}" ] || [ -z "${ZOT_PASSWORD}" ]; then
+            echo "::error::ZOT_USERNAME / ZOT_PASSWORD secrets are not set. Add them in repo Settings → Secrets and Variables → Actions."
+            exit 1
+          fi
+          # Write auth straight to ~/.docker/config.json. ZOT is plain HTTP, so
+          # `docker login` would attempt an HTTPS handshake and fail; buildx
+          # forwards this auth to buildkit in the Solve request, so the push
+          # authenticates. The buildkitd side must itself have the registry
+          # marked http+insecure (owned by the operator's BUILDKIT_HOST
+          # deployment — remote driver no longer carries our local buildkitd.toml).
+          AUTH="$(printf '%s:%s' "${ZOT_USERNAME}" "${ZOT_PASSWORD}" | base64 -w0)"
+          mkdir -p "${HOME}/.docker"
+          cat > "${HOME}/.docker/config.json" <<EOF
+          {
+            "auths": {
+              "${ZOT_REGISTRY}": { "auth": "${AUTH}" }
+            }
+          }
+          EOF
+          chmod 600 "${HOME}/.docker/config.json"
+          echo "Configured auth for ${ZOT_REGISTRY}"
+
+      - name: Set up Buildx (remote buildkitd)
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca  # v3.9.0
+        with:
+          # Cluster-resident buildkitd: its cache lives in the buildkitd volume,
+          # not on the ephemeral runner, so layer cache survives runner teardown.
+          driver: remote
+          endpoint: ${{ env.BUILDKIT_HOST }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75  # v6.9.0
+        env:
+          # Surfaced to the build as the secret values below; Dockerfile mounts
+          # `--secret id=pip-index-url,env=PIP_INDEX_URL` / `…,id=uv-default-index,
+          # env=UV_DEFAULT_INDEX` to inject the domestic PyPI index without the
+          # Dockerfile needing to know the mirror.
+          PIP_INDEX_URL: ${{ env.PYPI_INDEX }}
+          UV_DEFAULT_INDEX: ${{ env.PYPI_INDEX }}
+        with:
+          context: .
+          file: ${{ steps.render.outputs.dockerfile }}
+          platforms: ${{ inputs.platform || 'linux/amd64' }}
+          push: true
+          tags: |
+            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.sha_tag }}
+            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.ref_tag }}
+          # build-args: workflow_dispatch's extra_build_args is a newline-separated
+          # KEY=VALUE blob; empty under a push event (build-push-action ignores
+          # blank lines). Use `secret-envs` (NOT `secrets`): the Dockerfile mounts
+          # `--mount=type=secret,id=pip-index-url,env=PIP_INDEX_URL` (an ENV-typed
+          # mount), so the provider must emit `--secret id=…,env=ENVNAME`.
+          # `secrets:` makes file-typed secrets (src=) which an env mount ignores,
+          # leaving the index empty inside RUN → uv falls back to pypi.org and
+          # the build dies (verified). The env names are set in this step's
+          # env: block above.
+          build-args: |
+            ${{ inputs.extra_build_args }}
+          secret-envs: |
+            pip-index-url=PIP_INDEX_URL
+            uv-default-index=UV_DEFAULT_INDEX
+          no-cache: ${{ inputs.no_cache || false }}
+          # Skip provenance/SBOM attestations: they push an extra referrers
+          # manifest to ZOT, which older ZOT serves poorly. Plain image is what
+          # we want here.
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          PRIMARY: ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.sha_tag }}
+          FLOATING: ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.ref_tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          NAME: ${{ steps.tag.outputs.name }}
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          {
+            echo "### 🐳 Internal image — ${NAME}"
+            echo ""
+            echo "| ref | image |"
+            echo "| --- | --- |"
+            echo "| sha-tag (\`${SHA}\`) | \`${PRIMARY}\` |"
+            echo "| floating (branch/tag) | \`${FLOATING}\` |"
+            if [ -n "${DIGEST}" ]; then
+              echo "| digest | \`${DIGEST}\` |"
+            fi
+            echo ""
+            echo "Registry: \`${{ env.ZOT_REGISTRY }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

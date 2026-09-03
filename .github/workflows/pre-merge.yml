@@ -1,524 +1,262 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Internal (China-only self-hosted) Pre Merge CI.
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+# Pruned from upstream NVIDIA Pre Merge down to the checks this fork actually
+# runs on the `0xtoken-arc-runner-set` runner: pre-commit (python lint/format
+# hooks) and a rust fmt/clippy/unit-test/doc matrix. Docs/recipe/fern/operator/
+# uv-hook jobs were dropped — they need Fern docs infra, XPU/GPU tester hosts,
+# or upstream Docker registry pipelines this fork doesn't have.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Network: the runner reaches domestic mirrors (rsproxy for crates, aliyun for
+# pypi, gh-proxy for github) but NOT github.com / crates.io / pypi.org /
+# static.rust-lang.org directly. Each rust job writes a cargo config pointing
+# crates.io at rsproxy's sparse index with git-fetch-with-cli, plus a global
+# git insteadOf that routes every github clone through gh-proxy. The rust
+# toolchain is installed on the fly from rsproxy (rustup-init), so the runner
+# image does not need rust pre-baked. C/cc/protoc/openssl build deps are
+# installed at job start with `sudo apt-get install` (the runner runs as a
+# passwordless-sudo user, apt sources already point at the TUNA ubuntu mirror);
+# because runner pods are ephemeral this doesn't pollute the base runner image.
+#
+# Rust on this CPU runner: only lib/runtime/examples (a sub-workspace that
+# doesn't transitively pull dynamo-llm) gets clippy/unit-test/doc with
+# --no-default-features. dynamo-llm's default "block-manager" feature links
+# nixl-sys, which hard-fails without libnixl.so/CUDA, and --no-default-features
+# can't disable a DEPENDENCY's own defaults — so '.', lib/bindings/python and
+# lib/bindings/kvbm can't compile here. That full default-feature compile path
+# stays checked by the internal-build-push pipeline (dev image). `cargo fmt
+# --all --check` at the repo root still covers whole-workspace formatting.
 
 name: Pre Merge
 
 on:
   push:
     branches:
-    - main
-    - release/*.*.*
+      - main
   pull_request:
 
-# Cancel any previous check runs for the same pull request to avoid redundant workflows.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+  GH_PROXY: https://gh-proxy.com
+  RS_PROXY: https://rsproxy.cn
+  # Sparse-checkout cone shared by pre-commit + the rust matrix (root files are
+  # always included in cone mode). Covers everything the hooks and CPU-only
+  # rust checks touch. changed-files sets its own (`.github` only — it only
+  # needs .github/filters.yaml + .github/actions/changed-files, and tj-actions
+  # gets file lists from the REST API / git diff, not the working tree).
+  SPARSE: "lib components deploy tests examples dev recipes .cargo scripts .github"
+  #
+  # Why every checkout is INLINE here (not a reusable .github/actions/* composite
+  # referenced as astro-web3/dynamo/.github/actions/...@main): that composite is
+  # fetched by the runner via codeload.github.com/<repo>/tar.gz/<sha>, and on
+  # this domestic runner the private-repo tarball fetch is intermittently
+  # unreachable — the runner's built-in download caps at 3×100s, so a multi-
+  # minute github egress blip fails the whole run at "Set up job / Prepare all
+  # required actions" before any step runs. The inline script ships in the
+  # workflow file (delivered via the Actions API, no codeload) and its retry()
+  # loop runs 100 attempts with backoff, riding out long outages. The cost is
+  # the ~25-line checkout script duplicated per job — worth it for a reliable
+  # gate on this network.
+
 jobs:
   changed-files:
-    runs-on: ubuntu-latest
+    runs-on: 0xtoken-arc-runner-set
     outputs:
-      docs: ${{ steps.changes.outputs.docs }}
-      examples: ${{ steps.changes.outputs.examples }}
-      api_docs: ${{ steps.changes.outputs.api_docs }}
-      fern_components: ${{ steps.changes.outputs.fern_components }}
-      operator: ${{ steps.changes.outputs.operator }}
       rust: ${{ steps.changes.outputs.rust }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        # Do not use fetch-depth: 0 — changed-files now works with shallow clone
+      - name: Checkout (cached partial-clone mirror, depth 2)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIRROR_KEY: changed-files
+          DEPTH: '2'
+          SPARSE: .github
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          MK="${MIRROR_KEY//\//_}"
+          MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
+          retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" --filter=blob:none "$url" "$MIRROR"; }
+          fetch_sha(){ git -C "$MIRROR" fetch --filter=blob:none --depth "$DEPTH" --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
+            if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
+              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
+              retry seed || { echo "::error::mirror seed failed"; exit 1; }
+              : > "$MARK"
+            fi
+            git -C "$MIRROR" remote set-url origin "$url"
+            git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
+            git -C "$MIRROR" sparse-checkout set $SPARSE
+            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
+            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+          else
+            echo "::notice::no /cache/repos volume — direct partial clone"
+            git clone --no-tags --depth "$DEPTH" --filter=blob:none --no-checkout "$url" .
+            git sparse-checkout init --cone
+            git sparse-checkout set $SPARSE
+            git checkout -f "$GITHUB_SHA"
+          fi
       - name: Check for changes
         id: changes
-        uses: $/.github/actions/changed-files
+        uses: ./.github/actions/changed-files
         with:
           gh_token: ${{ github.token }}
 
+  pre-commit:
+    runs-on: 0xtoken-arc-runner-set
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (cached shallow mirror, full tree)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIRROR_KEY: pre-commit
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          MK="${MIRROR_KEY//\//_}"
+          MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
+          retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
+          # Full shallow clone (one pack, no --filter: partial-clone would trigger
+          # hundreds of per-blob on-demand fetches across the whole tree and die on
+          # a flaky link). First run pays the full pack; later runs only fetch the
+          # delta by SHA. No sparse — pre-commit --all-files walks the whole tree
+          # (validate-skills → .agents/skills, the docs/fern/* scripts, default
+          # trailing-whitespace/EOF hooks).
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 "$url" "$MIRROR"; }
+          fetch_sha(){ git -C "$MIRROR" fetch --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
+            if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
+              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
+              retry seed || { echo "::error::mirror seed failed"; exit 1; }
+              : > "$MARK"
+            fi
+            git -C "$MIRROR" remote set-url origin "$url"
+            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
+            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+          else
+            echo "::notice::no /cache/repos volume — direct shallow clone"
+            git clone --no-tags --depth 1 "$url" .
+            git checkout -f "$GITHUB_SHA"
+          fi
+      - name: Install python3-venv (sudo; pod is ephemeral, no base-image pollution)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-venv
+      - name: Install pre-commit into a venv
+        run: |
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install --quiet pre-commit
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
+        timeout-minutes: 15
+
+  rust:
+    needs: changed-files
+    if: needs.changed-files.outputs.rust == 'true'
+    runs-on: 0xtoken-arc-runner-set
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only CPU-safe sub-workspaces that don't transitively pull dynamo-llm
+        # (whose default `block-manager` feature needs NIXL/CUDA libs not on
+        # this CPU runner). `--no-default-features` does NOT disable a
+        # dependency's own defaults, so '.', lib/bindings/python and
+        # lib/bindings/kvbm still link nixl-sys and fail here; they stay
+        # compile-checked by the build-push dev-image build. Add a crate here
+        # only after confirming it's CPU-safe.
+        dir: ['lib/runtime/examples']
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (cached partial-clone mirror)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIRROR_KEY: rust-${{ matrix.dir }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          MK="${MIRROR_KEY//\//_}"
+          MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
+          retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 --filter=blob:none "$url" "$MIRROR"; }
+          fetch_sha(){ git -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
+            if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
+              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
+              retry seed || { echo "::error::mirror seed failed"; exit 1; }
+              : > "$MARK"
+            fi
+            git -C "$MIRROR" remote set-url origin "$url"
+            git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
+            git -C "$MIRROR" sparse-checkout set $SPARSE
+            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
+            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+          else
+            echo "::notice::no /cache/repos volume — direct partial clone"
+            git clone --no-tags --depth 1 --filter=blob:none --no-checkout "$url" .
+            git sparse-checkout init --cone
+            git sparse-checkout set $SPARSE
+            git checkout -f "$GITHUB_SHA"
+          fi
+      - name: Install build dependencies (sudo; pod is ephemeral, no base-image pollution)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config protobuf-compiler libssl-dev
+      - name: Configure cargo for rsproxy + gh-proxy
+        run: |
+          mkdir -p "$HOME/.cargo"
+          git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
+          printf '%s\n' \
+            '[source.crates-io]' 'replace-with = "rsproxy-sparse"' \
+            '[source.rsproxy-sparse]' 'registry = "sparse+https://rsproxy.cn/index/"' \
+            '[net]' 'git-fetch-with-cli = true' \
+            > "$HOME/.cargo/config.toml"
+      - name: Install Rust toolchain from rsproxy
+        run: |
+          if ! command -v rustc >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          # GITHUB_PATH only takes effect in the NEXT step, so export here too
+          # so the immediate `rustup component add` below sees the shim.
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup component add rustfmt clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Verify code formatting (whole workspace)
+        working-directory: .
+        run: cargo fmt --all -- --check
+      - name: Clippy (CPU path; no-default-features skips block-manager/CUDA/NIXL)
+        working-directory: ${{ matrix.dir }}
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Compile + unit tests
+        working-directory: ${{ matrix.dir }}
+        run: cargo test --locked --all-targets --no-default-features
+      - name: Doc tests
+        working-directory: ${{ matrix.dir }}
+        run: cargo test --locked --doc --no-default-features
+
   pre-merge-status-check:
-    runs-on: ubuntu-latest
-    needs: [changed-files, pre-commit, recipe-check, api-docs, fern-check, fern-broken-links, operator, rust-tests, rust-clippy, docs-website-composition]
+    needs: [changed-files, pre-commit, rust]
+    runs-on: 0xtoken-arc-runner-set
     if: always()
     steps:
       - name: "Check all dependent jobs"
         run: |
-          echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $result | ["success", "skipped"] | any($result == .))'
-
-  pre-commit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
-    - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
-      timeout-minutes: 3
-
-  recipe-check:
-    name: Recipe Check
-    needs: changed-files
-    if: needs.changed-files.outputs.examples == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
-      with:
-        python-version: '3.13'
-    - name: Install recipe check dependencies
-      # These packages provide options and warning types from the repository's
-      # shared pytest configuration. The recipe tests themselves do not import
-      # them.
-      run: |
-        python3 -m pip install \
-          'pytest>=8.0' \
-          'jinja2==3.1.6' \
-          'pyyaml>=6.0' \
-          'pydantic>=2' \
-          'pytest-asyncio>=1.0' \
-          'pytest-benchmark>=4'
-    - name: Check generated recipe manifests
-      run: python3 scripts/kustomize-matrix.py check
-    - name: Test recipe generators
-      run: python3 -m pytest --noconftest tests/test_kustomize_matrix.py tests/test_generate_kustomize_openapi.py
-
-  api-docs:
-    name: Generated API References
-    needs: changed-files
-    if: needs.changed-files.outputs.api_docs == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
-      with:
-        python-version: '3.13'
-    - name: Install API docs test dependencies
-      # pydantic and pytest-benchmark satisfy the module-referencing
-      # filterwarnings entries in the repository's pyproject.toml so pytest
-      # can load them under the repository's shared config. fsspec backs the
-      # storage.py doctest the suite executes.
-      run: |
-        python3 -m pip install \
-          'griffe==2.1.0' \
-          'pytest>=8.0' \
-          'pyyaml>=6.0' \
-          'pydantic>=2' \
-          'pytest-asyncio>=1.0' \
-          'pytest-benchmark>=4' \
-          'fsspec'
-    - name: Test generated API references
-      # docs/fern/scripts/tests is an explicit path so it opts back into
-      # collection despite the pyproject's docs/* ignore-glob (which keeps
-      # the rendered docs site content out of the default suite).
-      run: |
-        python3 -m pytest -q \
-          docs/fern/scripts/tests/test_gen_python_api.py \
-          docs/fern/scripts/tests/test_gen_rust_api.py \
-          docs/fern/scripts/tests/test_gen_kubernetes_api.py \
-          docs/fern/scripts/tests/test_api_reference_regressions.py \
-          docs/fern/scripts/tests/test_api_freshness.py
-    - name: Generate API references from source
-      # The Python/Rust references are publish-time artifacts (generated in
-      # fern-docs.yml against the branch being published), not committed
-      # files, so there is no freshness to check on a PR. What a code PR CAN
-      # break is generation itself -- a signature griffe cannot parse, a
-      # removed module the curated list still names -- so run both
-      # generators in write mode and fail the job if either errors. The
-      # output lands in gitignored paths and is discarded with the runner.
-      run: |
-        set -euo pipefail
-        python3 docs/fern/scripts/gen_python_api.py
-        python3 docs/fern/scripts/gen_rust_api.py
-    - name: Check generated Kubernetes API reference freshness
-      # Unlike the Python/Rust pages, the Kubernetes reference regenerates
-      # from a docs-owned source file and its output IS committed, so the
-      # freshness gate stays. On a PR, --since scopes the gate to what the
-      # branch itself changed (an unscoped gate reddens branches for merges
-      # to main they never made). On push to main there is no base and none
-      # is wanted: main is where global freshness must hold.
-      #
-      # The base commit is fetched explicitly because this job checks out
-      # shallow. Without it the range cannot resolve, and the helper fails
-      # closed to the strict gate -- safe, but the flag would do nothing.
-      env:
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-      run: |
-        set -euo pipefail
-        SINCE=()
-        if [ -n "${BASE_SHA:-}" ]; then
-          git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null || true
-          if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            SINCE=(--since "$BASE_SHA")
-          else
-            echo "::notice::base $BASE_SHA unavailable; using the strict gate"
-          fi
-        fi
-        python3 docs/fern/scripts/gen_kubernetes_api.py --check "${SINCE[@]}"
-
-  # Safe Fern docs checks run in pre-merge with read-only permissions.
-  fern-check:
-    name: Fern Configuration Check
-    needs: changed-files
-    if: needs.changed-files.outputs.docs == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
-      with:
-        node-version: '22'
-    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
-      with:
-        python-version: '3.13'
-    - name: Generate API reference pages
-      # index.yml's Reference tab points at the Python/Rust API pages, which
-      # are publish-time artifacts (gitignored, not committed). fern check
-      # validates that every nav path exists, so materialize them first.
-      run: |
-        python3 -m pip install 'griffe==2.1.0'
-        python3 docs/fern/scripts/gen_python_api.py
-        python3 docs/fern/scripts/gen_rust_api.py
-    - name: Install Fern CLI
-      run: npm install -g fern-api
-    - name: Validate Fern configuration
-      working-directory: docs/fern
-      run: fern check
-    - name: Cache the npm store for esbuild
-      if: needs.changed-files.outputs.fern_components == 'true'
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-      with:
-        path: ~/.npm
-        # Keyed on the pinned version, so bumping esbuild misses the cache
-        # deliberately rather than serving a stale tarball for a new pin.
-        key: npm-esbuild-0.24.0-${{ runner.os }}
-    - name: Parse custom MDX components
-      # Scoped to the narrow fern_components filter rather than the repo-wide
-      # docs one: this step exercises component sources only, and on the docs
-      # filter roughly 95% of its runs have no component change to check.
-      if: needs.changed-files.outputs.fern_components == 'true'
-      working-directory: docs/fern
-      # `fern check` validates configuration and navigation, never component
-      # syntax, so a component that does not compile merges green and only
-      # surfaces when Fern builds the site. #12330 shipped a LandingStyles.tsx
-      # whose CSS comment contained raw backticks that closed the enclosing
-      # template literal; it took #12402 to repair. esbuild transforms each
-      # file without bundling, which is exactly the syntax gate that was
-      # missing. Keep the version pinned so a bad esbuild release cannot
-      # redefine this gate.
-      run: |
-        set -euo pipefail
-        # Installed rather than run through `npx --yes`, which re-fetches
-        # 4.35 MB from the registry on every run with no integrity check. This
-        # step is a hard dependency of pre-merge-status-check, so a registry
-        # 5xx would red a PR that only touched an .mdx page. --no-save keeps
-        # the tree clean (there is no package.json beside fern/), and the
-        # npm cache below makes a warm run need no network at all.
-        npm install --no-save --no-audit --no-fund esbuild@0.24.0
-        ESBUILD=./node_modules/.bin/esbuild
-        # Same four suffixes Fern's bundler scans, and the same set
-        # docs/fern/scripts/check_component_imports.py covers. Keep them aligned.
-        find_components() {
-          find components -type f \
-            \( -name '*.tsx' -o -name '*.ts' -o -name '*.jsx' -o -name '*.js' \) "$@"
-        }
-        COUNT=$(find_components | wc -l)
-        if [ "$COUNT" -eq 0 ]; then
-          echo "::error::No component sources found under docs/fern/components"
-          exit 1
-        fi
-        echo "Parsing $COUNT component sources"
-        # Hoisted out of the xargs line: as a word on that command line the
-        # command substitution's exit status is invisible to set -e, so a
-        # failing mktemp expanded to --outdir= and esbuild ran anyway.
-        OUTDIR=$(mktemp -d)
-        # --outbase=. keeps the input tree structure under OUTDIR. Without it
-        # every entry point is keyed by basename alone, so a future Foo.ts plus
-        # Foo.tsx aborts the whole run with esbuild's "Two output files share
-        # the same path" -- a red gate whose message has nothing to do with
-        # component syntax.
-        find_components -print0 \
-          | xargs -0 "$ESBUILD" --outbase=. --outdir="$OUTDIR"
-
-  docs-website-composition:
-    name: Docs Website Composition Check
-    needs: changed-files
-    if: needs.changed-files.outputs.docs == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      with:
-        fetch-depth: 0
-    # The sync and release-version composition (rsync scopes, nav path
-    # transforms, the shared-Reference machinery) only executes on main pushes
-    # and tag cuts, so fern check pre-merge validates the source tree rather
-    # than the tree that actually publishes. This replays both jobs against
-    # docs-website and runs fern check on the composed result.
-    - name: Fetch docs-website
-      run: git fetch --no-tags --depth=1 origin docs-website:refs/remotes/origin/docs-website
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
-      with:
-        node-version: '22'
-    - name: Install Fern CLI
-      run: npm install -g fern-api
-    - name: Install yq
-      run: |
-        # Runner-owned bin dir: no sudo, and $GITHUB_PATH puts it ahead of
-        # any preinstalled yq for the steps that follow.
-        mkdir -p "$RUNNER_TEMP/bin"
-        wget -qO "$RUNNER_TEMP/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64
-        chmod +x "$RUNNER_TEMP/bin/yq"
-        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
-      with:
-        python-version: '3.13'
-    - name: Install replay dependencies
-      # The replay generates the publish-time Python/Rust API pages exactly
-      # like the real sync job; the script hard-fails without griffe. pyyaml
-      # must be reinstalled too: setup-python replaces the runner's system
-      # python3 (which bundles PyYAML) on PATH, and the replay's
-      # resolve_translation_links.py imports yaml.
-      run: python3 -m pip install 'griffe==2.1.0' 'pyyaml>=6.0'
-    - name: Replay the docs-website composition
-      env:
-        DOCS_WEBSITE_REF: origin/docs-website
-      run: bash docs/fern/scripts/simulate_docs_website.sh
-
-  fern-broken-links:
-    name: Fern Broken Links Check
-    needs: changed-files
-    if: needs.changed-files.outputs.docs == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
-      with:
-        node-version: '22'
-    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
-      with:
-        python-version: '3.13'
-    - name: Generate API reference pages
-      # The committed API landing links relatively to the publish-time
-      # Python/Rust pages; the broken-links checker resolves those through
-      # the file graph, so materialize them first.
-      run: |
-        python3 -m pip install 'griffe==2.1.0'
-        python3 docs/fern/scripts/gen_python_api.py
-        python3 docs/fern/scripts/gen_rust_api.py
-    - name: Install Fern CLI
-      run: npm install -g fern-api
-    - name: Check for broken links
-      working-directory: docs/fern
-      run: fern docs broken-links
-
-  operator:
-    needs: changed-files
-    if: needs.changed-files.outputs.operator == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      with:
-        fetch-depth: 0  # clustertest derives its alpha version from v1.3.0
-    - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
-    - name: Run operator checks
-      uses: $/.github/actions/check-deploy-component
-      with:
-        component: operator
-        platform: linux/amd64
-    - name: Run operator envtests
-      working-directory: deploy/operator
-      run: make envtest
-
-  rust-tests:
-    needs: changed-files
-    if: needs.changed-files.outputs.rust == 'true'
-    runs-on:
-      group: Fastchecker
-    strategy:
-      matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples', 'lib/bindings/kvbm'] }
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      with:
-        lfs: true
-    - name: Set up system dependencies
-      run: |
-        # Install protoc for Rust build dependencies (NOTE: much faster than apt install)
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_VER="30.2"
-        PROTOC_ZIP="protoc-${PROTOC_VER}-linux-x86_64.zip"
-        PROTOC_SHA256="327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f"
-        curl --retry 5 --retry-delay 2 -fsSLO "$PB_REL/download/v${PROTOC_VER}/${PROTOC_ZIP}"
-        echo "${PROTOC_SHA256}  ${PROTOC_ZIP}" | sha256sum -c -
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-        export PATH="$PATH:$HOME/.local/bin"
-        protoc --version
-    - name: Cache cargo artifacts
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
-    - name: Set up Rust Toolchain Components
-      run: rustup component add rustfmt
-    - name: Verify Code Formatting
-      working-directory: ${{ matrix.dir }}
-      run: cargo fmt -- --check
-    - name: Install and Run cargo-deny
-      working-directory: ${{ matrix.dir }}
-      run: |
-        cargo-deny --version || cargo install cargo-deny@0.19.0
-        cargo-deny -L error --all-features check licenses bans --config ${{ github.workspace }}/deny.toml
-    # Have an explicit step to build tests first to separate time spent on build vs execution.
-    - name: Compile Tests
-      working-directory: ${{ matrix.dir }}
-      run: cargo test --locked --no-run
-    - name: Run Doc Tests
-      working-directory: ${{ matrix.dir }}
-      run: cargo doc --no-deps && cargo test --locked --doc
-    - name: Run Unit Tests
-      working-directory: ${{ matrix.dir }}
-      # NOTE: --all-targets doesn't run doc tests
-      run: cargo test --locked --all-targets
-    - name: Run canonical replay feature tests
-      if: matrix.dir == '.'
-      working-directory: ${{ matrix.dir }}
-      run: |
-        cargo test --locked -p dynamo-bench --features replay-bench \
-          --bench offline_replay_bench -- \
-          testdata/mooncake_trace_tiny.jsonl \
-          --iterations 2 \
-          --canonical-reports-jsonl "$RUNNER_TEMP/canonical-replay.jsonl"
-    - name: Run Python bindings AIC feature tests
-      if: matrix.dir == 'lib/bindings/python'
-      working-directory: ${{ matrix.dir }}
-      run: cargo test --locked --features aic-forward-pass -- --nocapture
-    - name: Compile feature-gated benchmark entrypoints
-      if: matrix.dir == '.'
-      working-directory: ${{ matrix.dir }}
-      run: |
-        compile_bench() {
-          feature="$1"
-          shift
-          cargo test --locked -p dynamo-bench --no-default-features \
-            --features "$feature" "$@" --no-run
-        }
-
-        compile_bench multiturn --bench multiturn_bench
-        compile_bench satf --bin request_trace_to_satf
-        compile_bench request-trace-to-mooncake --bin request_trace_to_mooncake
-        compile_bench offline-replay --bench offline_replay_bench
-        compile_bench mooncake --bench mooncake_bench
-        compile_bench active-sequences --bench active_sequences_bench
-        compile_bench dc-ckf-consumer --bin dc_ckf_consumer_bench
-        compile_bench dc-ckf-relay --bench dc_ckf_relay_bench
-
-        cargo test --locked --no-default-features -p dynamo-bench \
-          --features request-trace-to-mooncake --test request_trace_to_mooncake
-
-        cargo test --locked -p dynamo-llm --no-default-features \
-          --features kv-router-stress --bench kv_router_bench --no-run
-
-  rust-clippy:
-    needs: changed-files
-    if: needs.changed-files.outputs.rust == 'true'
-    runs-on:
-      group: Fastchecker
-    strategy:
-      matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples', 'lib/bindings/kvbm'] }
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-      with:
-        lfs: true
-    - name: Verify Cargo lock file is in sync
-      working-directory: ${{ matrix.dir }}
-      run: cargo metadata --locked --format-version 1
-    - name: Set up system dependencies
-      run: |
-        # Install protoc for Rust build dependencies (NOTE: much faster than apt install)
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_VER="30.2"
-        PROTOC_ZIP="protoc-${PROTOC_VER}-linux-x86_64.zip"
-        PROTOC_SHA256="327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f"
-        curl --retry 5 --retry-delay 2 -fsSLO "$PB_REL/download/v${PROTOC_VER}/${PROTOC_ZIP}"
-        echo "${PROTOC_SHA256}  ${PROTOC_ZIP}" | sha256sum -c -
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-        export PATH="$PATH:$HOME/.local/bin"
-        protoc --version
-    - name: Cache cargo artifacts
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
-    - name: Set up Rust Toolchain Components
-      run: rustup component add clippy
-    - name: Run Clippy Checks
-      working-directory: ${{ matrix.dir }}
-      run: cargo clippy --no-deps --all-targets -- -D warnings
-    - name: Run Python bindings AIC feature clippy
-      if: matrix.dir == 'lib/bindings/python'
-      working-directory: ${{ matrix.dir }}
-      run: cargo clippy --locked --no-deps --features aic-forward-pass --all-targets -- -D warnings
-    - name: Lint Python bindings custom worker-selection policy support
-      if: matrix.dir == 'lib/bindings/python'
-      working-directory: ${{ matrix.dir }}
-      run: cargo clippy --locked --no-deps --features custom-policy,select-service --all-targets -- -D warnings
-    - name: Lint feature-gated benchmark entrypoints
-      if: matrix.dir == '.'
-      working-directory: ${{ matrix.dir }}
-      run: |
-        lint_bench() {
-          feature="$1"
-          shift
-          cargo clippy --locked --no-deps -p dynamo-bench --no-default-features \
-            --features "$feature" "$@" -- -D warnings
-        }
-
-        lint_bench multiturn --bench multiturn_bench
-        lint_bench satf --bin request_trace_to_satf
-        lint_bench request-trace-to-mooncake --bin request_trace_to_mooncake
-        lint_bench offline-replay --bench offline_replay_bench
-        lint_bench mooncake --bench mooncake_bench
-        lint_bench active-sequences --bench active_sequences_bench
-        lint_bench dc-ckf-consumer --bin dc_ckf_consumer_bench
-        lint_bench dc-ckf-relay --bench dc_ckf_relay_bench
-
-        cargo clippy --locked --no-deps -p dynamo-llm --no-default-features \
-          --features kv-router-stress --bench kv_router_bench -- -D warnings
-    - name: Install and Run cargo-machete
-      working-directory: ${{ matrix.dir }}
-      run: |
-        cargo-machete --version || cargo install cargo-machete@0.9.1
-        cargo machete
+          echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $r | ["success","skipped"] | any($r == .))'

@@ -141,6 +141,7 @@ ci: &ci
   - '.github/actions/**'
   - '.github/scripts/parse_buildkit_output.py'
   - '.github/scripts/route_buildkit.sh'
+  - 'scripts/render_dockerfile_cn.py'
   - 'container/Dockerfile.test'
 
 core:

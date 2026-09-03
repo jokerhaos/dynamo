@@ -381,6 +381,13 @@ RUN set -eux; \
         exit 1; \
     fi; \
     python3 -c 'import soundfile, torchaudio; from PIL import Image'
+
+# Keep the published runtime honest: Dynamo's SGLang entry points import these
+# modules before serving traffic, so fail the image build instead of crashing
+# every Frontend and worker after deployment.
+{% if target not in ("dev", "local-dev") %}
+RUN python3 -c "import dynamo.frontend.sglang_processor; import dynamo.sglang.args; import sglang"
+{% endif %}
 {% endif %}
 
 USER dynamo

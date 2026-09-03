@@ -14,6 +14,10 @@ use dynamo_kv_router::{
 };
 use dynamo_runtime::{
     error::{DynamoError, ErrorType, match_error_chain},
+    logging::{
+        DistributedTraceContext, get_distributed_tracing_context,
+        otel_parent_context_from_distributed,
+    },
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
     pipeline::{
         AsyncEngine, AsyncEngineContext, AsyncEngineContextProvider, Error, ManyOut, PushRouter,
@@ -22,7 +26,8 @@ use dynamo_runtime::{
     protocols::annotated::Annotated,
 };
 use futures::stream::{self, StreamExt};
-use tracing::Instrument;
+use tracing::{Instrument, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     kv_router::{
@@ -74,6 +79,35 @@ fn invalidate_on_non_cancellation(operation: &mut Option<AffinityAcquire>, error
 
 fn route_target(worker: WorkerWithDpRank) -> AffinityTarget {
     AffinityTarget::new(worker.worker_id, Some(worker.dp_rank))
+}
+
+fn route_request_span(
+    context_id: &str,
+    selection: &WorkerSelection,
+    phase: &RequestPhase,
+    trace_context: Option<&DistributedTraceContext>,
+) -> Span {
+    let request_id = trace_context
+        .and_then(|context| context.request_id.as_deref())
+        .unwrap_or(context_id);
+    let span = tracing::info_span!(
+        target: "request_span",
+        "kv_router.route_request",
+        request_id = %request_id,
+        worker_id = selection.worker.worker_id,
+        dp_rank = selection.worker.dp_rank,
+        overlap_blocks = selection.overlap_amount,
+        phase = ?phase,
+        trace_id = trace_context.map(|context| context.trace_id.as_str()),
+        parent_id = trace_context.map(|context| context.span_id.as_str()),
+        trace_flags = trace_context.map(|context| context.trace_flags.as_str()),
+        tracestate = trace_context.and_then(|context| context.tracestate.as_deref()),
+        x_request_id = trace_context.and_then(|context| context.x_request_id.as_deref()),
+    );
+    if let Some(parent) = trace_context.and_then(otel_parent_context_from_distributed) {
+        let _ = span.set_parent(parent);
+    }
+    span
 }
 
 fn monitor_response_stream<Sel>(

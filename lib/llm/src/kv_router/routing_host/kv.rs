@@ -197,19 +197,13 @@ where
         let dispatch = self
             .inner
             .dispatch_kv_admitted(updated_request, selection.worker.worker_id);
-        let dispatch_result = cancel_on_stop(
-            request_context.as_ref(),
-            dispatch.instrument(tracing::info_span!(
-                "kv_router.route_request",
-                request_id = %context_id,
-                worker_id = selection.worker.worker_id,
-                dp_rank = selection.worker.dp_rank,
-                overlap_blocks = selection.overlap_amount,
-                phase = ?phase,
-            )),
-        )
-        .await
-        .and_then(|result| result);
+        let trace_context = get_distributed_tracing_context();
+        let route_span =
+            route_request_span(&context_id, &selection, &phase, trace_context.as_ref());
+        let dispatch_result =
+            cancel_on_stop(request_context.as_ref(), dispatch.instrument(route_span))
+                .await
+                .and_then(|result| result);
         let response_stream = match dispatch_result {
             Ok(stream) => stream,
             Err(error) => {

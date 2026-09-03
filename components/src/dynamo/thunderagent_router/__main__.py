@@ -172,7 +172,7 @@ class ThunderAgentRouterHandler:
             self._capacity.stop()
         logger.info("ThunderAgent Router shutdown complete")
 
-    async def generate(self, request: dict[str, Any]):
+    async def generate(self, request: dict[str, Any], context=None):
         if self._scheduler is None or self._kv_router is None:
             raise RuntimeError(
                 "ThunderAgentRouterHandler used before initialize() was called"
@@ -212,7 +212,8 @@ class ThunderAgentRouterHandler:
             )
             first_chunk = True
             async for chunk in await self._kv_router.generate_from_request(
-                preprocessed  # type: ignore[arg-type]
+                preprocessed,  # type: ignore[arg-type]
+                context=context,
             ):
                 if proof is not None:
                     if first_chunk:
@@ -281,7 +282,8 @@ class ThunderAgentRouterHandler:
         )
         try:
             async for chunk in await self._kv_router.generate_from_request(
-                preprocessed  # type: ignore[arg-type]
+                preprocessed,  # type: ignore[arg-type]
+                context=context,
             ):
                 if first_chunk and worker_pin is None:
                     first_chunk = False

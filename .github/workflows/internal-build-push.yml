@@ -163,6 +163,19 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Remote `uses:` actions are downloaded before ANY run step, bypassing
+      # GH_PROXY. Use the Docker CLI/Buildx bundled in the ARC runner image.
+      - name: Check build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! docker buildx version; then
+            echo "::error::The ARC runner image must include Docker CLI and Buildx. Rebuild the runner image with these tools installed."
+            exit 1
+          fi
+          command -v jq
+          : "${BUILDKIT_HOST:?The ARC runner must provide BUILDKIT_HOST}"
+
       # Checkout: a shared partial-clone mirror under /cache/repos is reused
       # across runs — only the new commit's tiny delta is fetched each time, and
       # the work tree is cloned LOCALLY from that mirror (no 2nd github trip).
@@ -418,13 +431,6 @@ jobs:
             echo "::warning::pypi.nvidia.com remains (trtllm only) — no public domestic mirror; trtllm builds will fail fetching NVIDIA python packages. dynamo/vLLM/SGLang builds do not hit it."
           fi
 
-      - name: Export pod env to GITHUB env
-        shell: bash
-        run: |
-          # The ARC runner pod exposes the cluster's remote buildkitd endpoint
-          # (and only that) as an env var. Surface it for docker/setup-buildx-action.
-          echo "BUILDKIT_HOST=${BUILDKIT_HOST}" >> "$GITHUB_ENV"
-
       - name: Configure ZOT registry credentials
         shell: bash
         env:
@@ -456,51 +462,68 @@ jobs:
           echo "Configured auth for ${ZOT_REGISTRY}"
 
       - name: Set up Buildx (remote buildkitd)
-        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca  # v3.9.0
-        with:
-          # Cluster-resident buildkitd: its cache lives in the buildkitd volume,
-          # not on the ephemeral runner, so layer cache survives runner teardown.
-          driver: remote
-          endpoint: ${{ env.BUILDKIT_HOST }}
+        id: builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILDER="internal-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Only client-side configuration is created here. The remote daemon
+          # and its persistent layer cache survive runner teardown.
+          docker buildx create --name "$BUILDER" --driver remote "$BUILDKIT_HOST"
+          echo "name=$BUILDER" >> "$GITHUB_OUTPUT"
+          docker buildx inspect --bootstrap "$BUILDER"
 
       - name: Build and push image
         id: build
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75  # v6.9.0
+        shell: bash
         env:
-          # Surfaced to the build as the secret values below; Dockerfile mounts
-          # `--secret id=pip-index-url,env=PIP_INDEX_URL` / `…,id=uv-default-index,
-          # env=UV_DEFAULT_INDEX` to inject the domestic PyPI index without the
-          # Dockerfile needing to know the mirror.
+          BUILDER: ${{ steps.builder.outputs.name }}
+          DOCKERFILE: ${{ steps.render.outputs.dockerfile }}
+          PLATFORMS: ${{ inputs.platform || 'linux/amd64' }}
+          PRIMARY: ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.sha_tag }}
+          FLOATING: ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.ref_tag }}
+          EXTRA_BUILD_ARGS: ${{ inputs.extra_build_args }}
+          NO_CACHE: ${{ inputs.no_cache || false }}
           PIP_INDEX_URL: ${{ env.PYPI_INDEX }}
           UV_DEFAULT_INDEX: ${{ env.PYPI_INDEX }}
-        with:
-          context: .
-          file: ${{ steps.render.outputs.dockerfile }}
-          platforms: ${{ inputs.platform || 'linux/amd64' }}
-          push: true
-          tags: |
-            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.sha_tag }}
-            ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/${{ steps.tag.outputs.ref_tag }}
-          # build-args: workflow_dispatch's extra_build_args is a newline-separated
-          # KEY=VALUE blob; empty under a push event (build-push-action ignores
-          # blank lines). Use `secret-envs` (NOT `secrets`): the Dockerfile mounts
-          # `--mount=type=secret,id=pip-index-url,env=PIP_INDEX_URL` (an ENV-typed
-          # mount), so the provider must emit `--secret id=…,env=ENVNAME`.
-          # `secrets:` makes file-typed secrets (src=) which an env mount ignores,
-          # leaving the index empty inside RUN → uv falls back to pypi.org and
-          # the build dies (verified). The env names are set in this step's
-          # env: block above.
-          build-args: |
-            ${{ inputs.extra_build_args }}
-          secret-envs: |
-            pip-index-url=PIP_INDEX_URL
-            uv-default-index=UV_DEFAULT_INDEX
-          no-cache: ${{ inputs.no_cache || false }}
-          # Skip provenance/SBOM attestations: they push an extra referrers
-          # manifest to ZOT, which older ZOT serves poorly. Plain image is what
-          # we want here.
-          provenance: false
-          sbom: false
+        run: |
+          set -euo pipefail
+          METADATA="${RUNNER_TEMP}/internal-build-metadata.json"
+          ARGS=(docker buildx build
+                --builder "$BUILDER"
+                --file "$DOCKERFILE"
+                --platform "$PLATFORMS"
+                --push
+                --tag "$PRIMARY"
+                --tag "$FLOATING"
+                --metadata-file "$METADATA"
+                --progress plain
+                --provenance=false
+                --sbom=false
+                --secret id=pip-index-url,env=PIP_INDEX_URL
+                --secret id=uv-default-index,env=UV_DEFAULT_INDEX)
+          # Keep each newline-separated build argument intact, including spaces
+          # and commas. Pass secret environment names, never their values.
+          while IFS= read -r ARG || [ -n "$ARG" ]; do
+            ARG="${ARG%$'\r'}"
+            [[ "$ARG" =~ ^[[:space:]]*$ ]] && continue
+            ARGS+=(--build-arg "$ARG")
+          done <<< "$EXTRA_BUILD_ARGS"
+          if [ "$NO_CACHE" = "true" ]; then
+            ARGS+=(--no-cache)
+          fi
+          "${ARGS[@]}" .
+          DIGEST="$(jq -er '."containerimage.digest" | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' "$METADATA")"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Remove Buildx client configuration
+        if: ${{ always() && steps.builder.outputs.name != '' }}
+        shell: bash
+        env:
+          BUILDER: ${{ steps.builder.outputs.name }}
+        run: |
+          # Removing a remote-driver client does not stop or prune buildkitd.
+          docker buildx rm "$BUILDER"
 
       - name: Summary
         if: always()

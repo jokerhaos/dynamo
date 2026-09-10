@@ -579,8 +579,9 @@ ARG ENABLE_MEDIA_FFMPEG
 {% endif %}
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
-    --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
-    --mount=type=cache,target=/root/.cargo/git,sharing=shared \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
+    --mount=type=cache,id=dynamo-runtime-target-{{ framework }}-{{ device_key }}-${TARGETARCH},target=/opt/dynamo/target,sharing=locked \
     --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export UV_CACHE_DIR=/root/.cache/uv && \
@@ -652,10 +653,10 @@ RUN --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.
 # source cache so the rust NOTICES generator can inline upstream license text
 # (the runtime image keeps only the compiled wheel). Keyed "<name>-<version>"
 # to match generators/rust.py. Best-effort: unreadable/absent files are skipped
-# and the generator falls back to canonical SPDX text. cargo's registry lives
-# under CARGO_HOME and/or the cache-mounted /root/.cargo — scan both.
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
-    for src in "${CARGO_HOME}/registry/src" /root/.cargo/registry/src; do \
+# and the generator falls back to canonical SPDX text. Read the same registry
+# cache used by the wheel build above.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
+    for src in "${CARGO_HOME}/registry/src"; do \
         [ -d "$src" ] || continue; \
         find "$src" -mindepth 2 -maxdepth 2 -type d | while IFS= read -r crate; do \
             dest="/opt/dynamo/rust-licenses/$(basename "$crate")"; \
@@ -697,8 +698,8 @@ ARG ENABLE_SOURCE_ARCHIVAL=false
 # Mount cargo registry + git caches so re-runs don't re-download the
 # ~750 crates from crates.io every build. `sharing=shared` lets parallel
 # builds (e.g. multiple frameworks in CI) read the same cache concurrently.
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
-    --mount=type=cache,target=/root/.cargo/git,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
     if [ "$ENABLE_SOURCE_ARCHIVAL" = "true" ]; then \
         mkdir -p /tmp/dynamo-vendor-full && \
         cd /opt/dynamo && \
@@ -738,7 +739,7 @@ RUN --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.
 ##################################
 ##### wheel_builder ##############
 ##################################
-{% if ("nixl_ref" in context[framework] or device == "xpu") and target != "frontend" %}
+{% if ("nixl_ref" in context[framework] or device == "xpu") and target != "frontend" and not (framework == "sglang" and device == "cuda" and target == "runtime" and context.sglang.enable_kvbm == "false") %}
 # Builds NIXL (native + Python wheel) and NIXL-linked extension wheels, then
 # consolidates all wheels.
 # Runtime templates COPY from this stage.
@@ -746,6 +747,8 @@ RUN --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.
 # because no upstream XPU runtime image ships pre-built NIXL.
 # Note: frontend is excluded — it installs NIXL from PyPI at NIXL_REF and does
 # not install KVBM, so nothing in that image consumes a from-source NIXL build.
+# SGLang CUDA runtime also reuses its base image's NIXL; only its dev targets
+# need the extra SDK. Keep this source build for XPU and KVBM-enabled variants.
 
 FROM wheel_builder_base AS wheel_builder
 
@@ -844,8 +847,8 @@ COPY components/ /opt/dynamo/components/
 ARG ENABLE_KVBM
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
-    --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
-    --mount=type=cache,target=/root/.cargo/git,sharing=shared \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
     --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export UV_CACHE_DIR=/root/.cache/uv && \
@@ -887,9 +890,9 @@ COPY --from=runtime_wheel_builder /opt/dynamo/dist/ /opt/dynamo/dist/
 # Venv python required: compliance.overrides needs pyyaml, absent from the
 # system python3 (see the runtime_wheel_builder bundling step).
 COPY container/compliance /opt/compliance
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
     set -u; \
-    for src in "${CARGO_HOME}/registry/src" /root/.cargo/registry/src; do \
+    for src in "${CARGO_HOME}/registry/src"; do \
         [ -d "$src" ] || continue; \
         find "$src" -mindepth 2 -maxdepth 2 -type d | while IFS= read -r crate; do \
             dest="/opt/dynamo/rust-licenses/$(basename "$crate")"; \
@@ -911,7 +914,5 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
 # frontend installs it from PyPI; neither builds Dynamo KVBM. Keep this alias so
 # downstream stages can still COPY Dynamo wheels and build tools from a common
 # wheel_builder stage name.
-# SGLang dev/source builds may link nixl-sys against stubs when native NIXL is
-# absent; block-manager/KVBM runtime work should use vllm/trtllm/none images.
 FROM runtime_wheel_builder AS wheel_builder
 {% endif %}

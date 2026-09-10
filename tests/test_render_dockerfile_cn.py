@@ -92,7 +92,7 @@ def dockerfile_renderer():
 @pytest.mark.parametrize(
     "framework,target,device,cuda_version,expected_count",
     [
-        ("sglang", "runtime", "cuda", "13.0", 1),
+        ("sglang", "runtime", "cuda", "13.0", 0),
         ("sglang", "dev", "cuda", "13.0", 1),
         ("sglang", "runtime", "xpu", "", 1),
         ("vllm", "runtime", "cuda", "13.0", 1),

@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import AsyncGenerator
 from concurrent.futures import ProcessPoolExecutor
@@ -24,7 +25,7 @@ from dynamo._internal import ModelDeploymentCard
 from dynamo.common.multimodal.cache_uuid import reject_unsupported_multimodal_uuids
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
-from dynamo.llm.exceptions import InvalidArgument, Unknown
+from dynamo.llm.exceptions import HttpError, InvalidArgument, Unknown
 
 from .sglang_prepost import (
     ReasoningParser,
@@ -41,6 +42,8 @@ from .sglang_prepost import (
 from .thinking import runtime_default_thinking_mode
 from .utils import (
     PreprocessError,
+    as_error_envelope,
+    backend_invalid_argument_to_http_error,
     extract_mm_urls,
     handle_engine_error,
     make_internal_error,
@@ -52,6 +55,42 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Map SGLang/backend error strings to client-facing HTTP errors. The Rust HTTP
+# service recovers BackendInvalidArgument envelopes and sets a proper status, but
+# the Python chat-processor path bypasses it, so bare strings -- an over-context
+# ValueError from SGLang, a LocalRouter queue-overflow rejection -- land as
+# opaque 500s. Mirror the vLLM processor's 4xx-with-reason behavior.
+# Temporary fork patch: remove when DEP #14354 (unified semantic error
+# propagation) lands and covers the SGLang disagg path.
+_SGL_OVERCONTEXT_RE = re.compile(
+    r"longer than the model's context length"
+    r"|exceeds\s+context"
+    r"|input is too long"
+    r"|context length",
+    re.IGNORECASE,
+)
+_SGL_QUEUE_OVERFLOW_RE = re.compile(
+    r"queue[^.\n]*limit reached|policy class.*queue",
+    re.IGNORECASE,
+)
+
+
+def _classify_sglang_error(message: str) -> HttpError | None:
+    """Map a backend or routed-engine error message to a client-facing HttpError.
+
+    Returns None when the message is none of the recognized shapes, so the
+    caller keeps its existing fallback (an SSE error envelope or Unknown).
+    """
+    err = backend_invalid_argument_to_http_error(RuntimeError(message))
+    if err is not None:
+        return err
+    if _SGL_OVERCONTEXT_RE.search(message):
+        return HttpError(400, message)
+    if _SGL_QUEUE_OVERFLOW_RE.search(message):
+        return HttpError(429, message)
+    return None
 
 
 def _cached_tokens_from_usage(usage: dict[str, Any] | None) -> int | None:
@@ -847,7 +886,10 @@ class SglangProcessor:
                         request_id,
                         message,
                     )
-                    yield make_internal_error(request_id, message)
+                    err = _classify_sglang_error(message)
+                    if err is not None:
+                        raise err
+                    yield as_error_envelope(make_internal_error(request_id, message))
                     break
                 engine_response = dynamo_response.data()
 
@@ -860,7 +902,9 @@ class SglangProcessor:
                     not isinstance(engine_response, dict)
                     or "token_ids" not in engine_response
                 ):
-                    yield handle_engine_error(engine_response, request_id, logger)
+                    yield as_error_envelope(
+                        handle_engine_error(engine_response, request_id, logger)
+                    )
                     break
 
                 new_ids = engine_response["token_ids"]
@@ -925,7 +969,18 @@ class SglangProcessor:
                         break
         except Unknown:
             raise
+        except HttpError:
+            raise
         except Exception as e:
+            err = _classify_sglang_error(str(e))
+            if err is not None:
+                logger.warning(
+                    "Backend rejected request %s with %d: %s",
+                    request_id,
+                    err.code,
+                    err.message,
+                )
+                raise err from e
             logger.exception("Error generating response for request %s", request_id)
             raise Unknown(
                 f"Error generating response for request {request_id}: {e}"

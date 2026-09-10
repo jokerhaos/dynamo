@@ -21,6 +21,7 @@ Env vars consumed (all required unless noted):
 
 import os
 import re
+import shlex
 import sys
 
 # hosts we redirect, or that are known-internal / expected-foreign, so the
@@ -81,6 +82,23 @@ def rewrite(s):
 
     # 1) GitHub releases + git clone/remote -> gh-proxy prefix.
     s = s.replace("https://github.com/", f"{GH}/https://github.com/")
+
+    # NIXL fetches Taskflow via Meson's wrap downloader, not git. The wrap
+    # only exists after checkout, so Dockerfile URL rewriting cannot reach it.
+    # Change only its source URL; keep the upstream source_hash intact.
+    wrap_rewrite = (
+        "from pathlib import Path; "
+        "p = Path('subprojects/taskflow.wrap'); "
+        "p.write_text(p.read_text().replace("
+        "'source_url = https://github.com/', "
+        f"{'source_url = ' + GH.rstrip('/') + '/https://github.com/'!r})) "
+        "if p.is_file() else None"
+    )
+    nixl_wheel_name = "    ./contrib/tomlutil.py --wheel-name $PKG_NAME pyproject.toml"
+    s = s.replace(
+        nixl_wheel_name,
+        f"    python3 -c {shlex.quote(wrap_rewrite)} && \\\n" + nixl_wheel_name,
+    )
 
     # 2) libvpx: googlesource has no China mirror -> GitHub mirror, proxied.
     #    github.com/webm/libvpx is a 404 (served to anon as 401 -> "could not

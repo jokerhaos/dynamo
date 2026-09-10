@@ -90,8 +90,16 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | `--model-name` | Yes | `DYN_GLOBAL_ROUTER_MODEL_NAME` | - | Model name for registration (must match workers) |
 | `--namespace` | No | `DYN_NAMESPACE` | "dynamo" | Namespace for global router |
 | `--component-name` | No | `DYN_GLOBAL_ROUTER_COMPONENT_NAME` | "global_router" | Component name |
+| `--dyn-tool-call-parser` | No | `DYN_TOOL_CALL_PARSER` | None | Tool call parser advertised to the frontend |
+| `--dyn-reasoning-parser` | No | `DYN_REASONING_PARSER` | None | Reasoning parser advertised to the frontend |
 | `--default-ttft-target-ms` | No | `DYN_GLOBAL_ROUTER_DEFAULT_TTFT_TARGET_MS` | None | Default TTFT target (ms) for prefill pool selection |
 | `--default-itl-target-ms` | No | `DYN_GLOBAL_ROUTER_DEFAULT_ITL_TARGET_MS` | None | Default ITL target (ms) for pool selection |
+
+The Global Router registers its own model metadata; it does not automatically copy parser settings from downstream workers. Set its parser options to match the workers for the served model. Both options are forwarded through `runtime_config` in disaggregated and aggregated mode; omitting them leaves the parser fields unset. For a model using the GLM parsers, append:
+
+```bash
+--dyn-tool-call-parser glm47 --dyn-reasoning-parser glm45
+```
 
 ## Configuration
 

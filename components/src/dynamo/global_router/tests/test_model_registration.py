@@ -3,6 +3,7 @@
 
 """Tests for GlobalRouter model registration."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -35,16 +36,60 @@ class FakeRuntime:
         return FakeEndpoint()
 
 
+@pytest.fixture(
+    params=[
+        (None, None, None, None),
+        ("glm47", "glm45", None, None),
+        (None, None, "glm47", "glm45"),
+        ("hermes", "qwen3", "glm47", "glm45"),
+        ("glm47", None, None, None),
+        (None, "glm45", None, None),
+    ],
+    ids=["defaults", "cli", "env", "cli-over-env", "tool-only", "reasoning-only"],
+)
+def registration_config(request, monkeypatch):
+    """Parse real CLI/env configuration for each registration path."""
+    cli_tool, cli_reasoning, env_tool, env_reasoning = request.param
+    for name, value in (
+        ("DYN_TOOL_CALL_PARSER", env_tool),
+        ("DYN_REASONING_PARSER", env_reasoning),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    argv = [
+        "global-router",
+        "--config",
+        "test-config.json",
+        "--model-name",
+        "test-model",
+        "--namespace",
+        "test-namespace",
+        "--component-name",
+        "global-router",
+    ]
+    if cli_tool is not None:
+        argv.extend(["--dyn-tool-call-parser", cli_tool])
+    if cli_reasoning is not None:
+        argv.extend(["--dyn-reasoning-parser", cli_reasoning])
+    monkeypatch.setattr(sys, "argv", argv)
+    return (
+        global_router_main.parse_args(),
+        cli_tool if cli_tool is not None else env_tool,
+        cli_reasoning if cli_reasoning is not None else env_reasoning,
+    )
+
+
 @pytest.mark.asyncio
-async def test_disagg_registration_skips_model_weights(monkeypatch):
-    """Disaggregated registration retains metadata without model weights."""
+async def test_disagg_registration_skips_model_weights(
+    monkeypatch, registration_config
+):
+    """Disaggregated registration forwards parsers without model weights."""
     register_model = AsyncMock()
     monkeypatch.setattr(global_router_main, "register_model", register_model)
-    config = SimpleNamespace(
-        model_name="test-model",
-        namespace="test-namespace",
-        component_name="global-router",
-    )
+    config, tool_call_parser, reasoning_parser = registration_config
     handler = SimpleNamespace(
         handle_prefill=AsyncMock(),
         handle_decode=AsyncMock(),
@@ -62,18 +107,18 @@ async def test_disagg_registration_skips_model_weights(monkeypatch):
     assert decode_call.kwargs["ignore_weights"] is True
     assert decode_call.kwargs["model_path"] == "test-model"
     assert decode_call.kwargs["model_name"] == "test-model"
+    for call in (prefill_call, decode_call):
+        runtime_config = call.kwargs["runtime_config"]
+        assert runtime_config.tool_call_parser == tool_call_parser
+        assert runtime_config.reasoning_parser == reasoning_parser
 
 
 @pytest.mark.asyncio
-async def test_agg_registration_skips_model_weights(monkeypatch):
-    """Aggregated registration retains metadata without model weights."""
+async def test_agg_registration_skips_model_weights(monkeypatch, registration_config):
+    """Aggregated registration forwards parsers without model weights."""
     register_model = AsyncMock()
     monkeypatch.setattr(global_router_main, "register_model", register_model)
-    config = SimpleNamespace(
-        model_name="test-model",
-        namespace="test-namespace",
-        component_name="global-router",
-    )
+    config, tool_call_parser, reasoning_parser = registration_config
     handler = SimpleNamespace(handle_generate=AsyncMock())
 
     await global_router_main._serve_agg(FakeRuntime(), config, handler)
@@ -83,3 +128,6 @@ async def test_agg_registration_skips_model_weights(monkeypatch):
     assert register_model.await_args.kwargs["ignore_weights"] is True
     assert register_model.await_args.kwargs["model_path"] == "test-model"
     assert register_model.await_args.kwargs["model_name"] == "test-model"
+    runtime_config = register_model.await_args.kwargs["runtime_config"]
+    assert runtime_config.tool_call_parser == tool_call_parser
+    assert runtime_config.reasoning_parser == reasoning_parser

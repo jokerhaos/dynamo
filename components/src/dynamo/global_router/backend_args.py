@@ -5,6 +5,7 @@
 
 from typing import Optional
 
+from dynamo._core import get_reasoning_parser_names, get_tool_parser_names
 from dynamo.common.configuration.arg_group import ArgGroup
 from dynamo.common.configuration.config_base import ConfigBase
 from dynamo.common.configuration.utils import add_argument, env_or_default
@@ -48,6 +49,22 @@ class DynamoGlobalRouterArgGroup(ArgGroup):
         )
         add_argument(
             g,
+            flag_name="--dyn-tool-call-parser",
+            env_var="DYN_TOOL_CALL_PARSER",
+            default=None,
+            help="Tool call parser advertised to the frontend for this model.",
+            choices=get_tool_parser_names(),
+        )
+        add_argument(
+            g,
+            flag_name="--dyn-reasoning-parser",
+            env_var="DYN_REASONING_PARSER",
+            default=None,
+            help="Reasoning parser advertised to the frontend for this model.",
+            choices=get_reasoning_parser_names(),
+        )
+        add_argument(
+            g,
             flag_name="--default-ttft-target-ms",
             obsolete_flag="--default-ttft-target",
             env_var="DYN_GLOBAL_ROUTER_DEFAULT_TTFT_TARGET_MS",
@@ -77,6 +94,8 @@ class DynamoGlobalRouterConfig(ConfigBase):
     model_name: Optional[str] = None
     namespace: str
     component_name: str
+    dyn_tool_call_parser: Optional[str] = None
+    dyn_reasoning_parser: Optional[str] = None
     default_ttft_target_ms: Optional[float] = None
     default_itl_target_ms: Optional[float] = None
 

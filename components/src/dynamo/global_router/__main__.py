@@ -26,7 +26,13 @@ import logging
 
 import uvloop
 
-from dynamo.llm import ModelInput, ModelType, WorkerType, register_model
+from dynamo.llm import (
+    ModelInput,
+    ModelRuntimeConfig,
+    ModelType,
+    WorkerType,
+    register_model,
+)
 from dynamo.runtime import DistributedRuntime, dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
 
@@ -35,6 +41,14 @@ from .handler import GlobalRouterHandler
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+
+def _build_runtime_config(config: DynamoGlobalRouterConfig) -> ModelRuntimeConfig:
+    """Build parser metadata for the Global Router's model registrations."""
+    runtime_config = ModelRuntimeConfig()
+    runtime_config.tool_call_parser = config.dyn_tool_call_parser
+    runtime_config.reasoning_parser = config.dyn_reasoning_parser
+    return runtime_config
 
 
 def parse_args() -> DynamoGlobalRouterConfig:
@@ -116,6 +130,7 @@ async def _serve_disagg(
         model_name=config.model_name,
         worker_type=WorkerType.Prefill,
         needs=[[WorkerType.Decode]],
+        runtime_config=_build_runtime_config(config),
         ignore_weights=True,
     )
     logger.info(
@@ -131,6 +146,7 @@ async def _serve_disagg(
         model_name=config.model_name,
         worker_type=WorkerType.Decode,
         needs=[[WorkerType.Prefill]],
+        runtime_config=_build_runtime_config(config),
         ignore_weights=True,
     )
     logger.info(
@@ -186,6 +202,7 @@ async def _serve_agg(
         model_path=config.model_name,
         model_name=config.model_name,
         worker_type=WorkerType.Aggregated,
+        runtime_config=_build_runtime_config(config),
         ignore_weights=True,
     )
     logger.info(

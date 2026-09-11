@@ -751,6 +751,11 @@ class SglangProcessor:
         post_proc_total_ms = 0.0
         created_ts = int(time.time())
         stream_interval = self.stream_interval
+        # True once any frame has been yielded to the client. A classified
+        # backend error arriving before the first byte can still set the HTTP
+        # status (raise); one arriving mid-stream, after the 200 is committed,
+        # must be sent as an SSE error event so the client sees the reason.
+        yielded_any = False
 
         try:
             dynamo_stream = await self.routed_engine.generate(
@@ -888,7 +893,12 @@ class SglangProcessor:
                     )
                     err = _classify_sglang_error(message)
                     if err is not None:
-                        raise err
+                        if not yielded_any:
+                            raise err
+                        yield as_error_envelope(
+                            make_internal_error(request_id, err.message)
+                        )
+                        break
                     yield as_error_envelope(make_internal_error(request_id, message))
                     break
                 engine_response = dynamo_response.data()
@@ -927,6 +937,7 @@ class SglangProcessor:
                             stop_terminated=False,
                             engine_data=None,
                         )
+                        yielded_any = True
                         yield envelope
                         if post.locally_finished:
                             break
@@ -964,6 +975,7 @@ class SglangProcessor:
                         stop_terminated=stop_terminated,
                         engine_data=engine_data,
                     )
+                    yielded_any = True
                     yield envelope
                     if post.locally_finished:
                         break
@@ -980,11 +992,14 @@ class SglangProcessor:
                     err.code,
                     err.message,
                 )
-                raise err from e
-            logger.exception("Error generating response for request %s", request_id)
-            raise Unknown(
-                f"Error generating response for request {request_id}: {e}"
-            ) from e
+                if not yielded_any:
+                    raise err from e
+                yield as_error_envelope(make_internal_error(request_id, err.message))
+            else:
+                logger.exception("Error generating response for request %s", request_id)
+                raise Unknown(
+                    f"Error generating response for request {request_id}: {e}"
+                ) from e
         finally:
             if self.debug_perf and token_count > 0:
                 logger.info(

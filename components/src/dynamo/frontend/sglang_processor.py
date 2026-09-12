@@ -58,20 +58,22 @@ logger = logging.getLogger(__name__)
 
 
 # Map SGLang/backend error strings so the reason reaches the client instead of
-# an opaque 500. On the default streaming path the HTTP service commits 200 up
-# front, so a classified backend error is emitted as an SSE error event
-# (as_error_envelope) carrying the reason -- the HTTP status cannot be set once
-# streaming has committed. Remove this when GitHub issue #14354 (DEP: unified
-# semantic error propagation) lands and covers the SGLang disagg path.
+# an opaque 500. A classified backend error is emitted as a tagged SSE error
+# frame whose comment carries {"message", "code"} JSON: the HTTP service's
+# pre-commit error peek (DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS) json-parses that
+# comment to return the typed status before committing the stream, and
+# forwards a 4xx message as-is; without the peek, streaming still surfaces the
+# comment as the SSE error text. Remove this when GitHub issue #14354 (DEP:
+# unified semantic error propagation) lands and covers the SGLang disagg path.
+_SGL_QUEUE_OVERFLOW_RE = re.compile(
+    r"queue[^.\n]*limit reached|policy class.*queue",
+    re.IGNORECASE,
+)
 _SGL_OVERCONTEXT_RE = re.compile(
     r"longer than the model's context length"
     r"|exceeds\s+context"
     r"|input is too long"
     r"|context length",
-    re.IGNORECASE,
-)
-_SGL_QUEUE_OVERFLOW_RE = re.compile(
-    r"queue[^.\n]*limit reached|policy class.*queue",
     re.IGNORECASE,
 )
 
@@ -82,14 +84,32 @@ def _classify_sglang_error(message: str) -> HttpError | None:
     Returns None when the message is none of the recognized shapes, so the
     caller keeps its existing fallback (an SSE error envelope or Unknown).
     """
+    # Queue overflow outranks the BackendInvalidArgument envelope: the
+    # LocalRouter wraps its capacity rejection in that prefix, so the prefix
+    # alone is not evidence of a genuinely invalid argument.
+    if _SGL_QUEUE_OVERFLOW_RE.search(message):
+        return HttpError(429, message)
+    if _SGL_OVERCONTEXT_RE.search(message):
+        return HttpError(400, message)
     err = backend_invalid_argument_to_http_error(RuntimeError(message))
     if err is not None:
         return err
-    if _SGL_OVERCONTEXT_RE.search(message):
-        return HttpError(400, message)
-    if _SGL_QUEUE_OVERFLOW_RE.search(message):
-        return HttpError(429, message)
     return None
+
+
+def _classified_error_envelope(err: HttpError) -> dict[str, Any]:
+    """Tagged SSE error frame whose comment carries {"message", "code"} JSON.
+
+    `extract_backend_error_if_present` in the HTTP service json-parses the
+    comment of an event: "error" frame, so the pre-commit peek can return the
+    typed status (a 4xx message forwards as-is; a 5xx is sanitized). Plain
+    text parses to nothing and falls back to a sanitized 500.
+    """
+    return {
+        "_dynamo_annotated": True,
+        "event": "error",
+        "comment": [json.dumps({"message": err.message, "code": err.code})],
+    }
 
 
 def _cached_tokens_from_usage(usage: dict[str, Any] | None) -> int | None:
@@ -887,9 +907,7 @@ class SglangProcessor:
                     )
                     err = _classify_sglang_error(message)
                     if err is not None:
-                        yield as_error_envelope(
-                            make_internal_error(request_id, err.message)
-                        )
+                        yield _classified_error_envelope(err)
                         break
                     yield as_error_envelope(make_internal_error(request_id, message))
                     break
@@ -980,7 +998,7 @@ class SglangProcessor:
                     err.code,
                     err.message,
                 )
-                yield as_error_envelope(make_internal_error(request_id, err.message))
+                yield _classified_error_envelope(err)
             else:
                 logger.exception("Error generating response for request %s", request_id)
                 raise Unknown(

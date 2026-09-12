@@ -57,13 +57,12 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-# Map SGLang/backend error strings to client-facing HTTP errors. The Rust HTTP
-# service recovers BackendInvalidArgument envelopes and sets a proper status, but
-# the Python chat-processor path bypasses it, so bare strings -- an over-context
-# ValueError from SGLang, a LocalRouter queue-overflow rejection -- land as
-# opaque 500s. Mirror the vLLM processor's 4xx-with-reason behavior.
-# Temporary fork patch: remove when DEP #14354 (unified semantic error
-# propagation) lands and covers the SGLang disagg path.
+# Map SGLang/backend error strings so the reason reaches the client instead of
+# an opaque 500. On the default streaming path the HTTP service commits 200 up
+# front, so a classified backend error is emitted as an SSE error event
+# (as_error_envelope) carrying the reason -- the HTTP status cannot be set once
+# streaming has committed. Remove this when GitHub issue #14354 (DEP: unified
+# semantic error propagation) lands and covers the SGLang disagg path.
 _SGL_OVERCONTEXT_RE = re.compile(
     r"longer than the model's context length"
     r"|exceeds\s+context"
@@ -751,11 +750,6 @@ class SglangProcessor:
         post_proc_total_ms = 0.0
         created_ts = int(time.time())
         stream_interval = self.stream_interval
-        # True once any frame has been yielded to the client. A classified
-        # backend error arriving before the first byte can still set the HTTP
-        # status (raise); one arriving mid-stream, after the 200 is committed,
-        # must be sent as an SSE error event so the client sees the reason.
-        yielded_any = False
 
         try:
             dynamo_stream = await self.routed_engine.generate(
@@ -893,8 +887,6 @@ class SglangProcessor:
                     )
                     err = _classify_sglang_error(message)
                     if err is not None:
-                        if not yielded_any:
-                            raise err
                         yield as_error_envelope(
                             make_internal_error(request_id, err.message)
                         )
@@ -937,7 +929,6 @@ class SglangProcessor:
                             stop_terminated=False,
                             engine_data=None,
                         )
-                        yielded_any = True
                         yield envelope
                         if post.locally_finished:
                             break
@@ -975,13 +966,10 @@ class SglangProcessor:
                         stop_terminated=stop_terminated,
                         engine_data=engine_data,
                     )
-                    yielded_any = True
                     yield envelope
                     if post.locally_finished:
                         break
         except Unknown:
-            raise
-        except HttpError:
             raise
         except Exception as e:
             err = _classify_sglang_error(str(e))
@@ -992,8 +980,6 @@ class SglangProcessor:
                     err.code,
                     err.message,
                 )
-                if not yielded_any:
-                    raise err from e
                 yield as_error_envelope(make_internal_error(request_id, err.message))
             else:
                 logger.exception("Error generating response for request %s", request_id)

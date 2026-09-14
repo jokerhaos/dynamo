@@ -24,6 +24,11 @@
 #   Secrets:
 #     ZOT_USERNAME  - ZOT registry username (push auth)
 #     ZOT_PASSWORD  - ZOT registry password / token
+#     SCCACHE_ACCESS_KEY / SCCACHE_SECRET_KEY (optional) - MinIO access key
+#       pair for the in-image sccache compile cache (Rust/ffmpeg/UCX/
+#       libfabric recompiles hit MinIO instead of rebuilding). Together with
+#       the three SCCACHE_* variables below, any input missing and sccache
+#       stays off. The key needs read/write on the bucket only.
 #   Variables (optional; defaults shown — override only if your cluster differs):
 #     ZOT_REGISTRY   = zot.orc-registry.svc.cluster.local:5000   (push target)
 #     ZOT_REPOSITORY = dynamo                                    (image namespace)
@@ -33,11 +38,29 @@
 #     DNF_MIRROR     = mirrors.aliyun.com                       (almalinux dnf; TUNA has no almalinux)
 #     PYPI_INDEX     = https://mirrors.aliyun.com/pypi/simple/         (TUNA 404s aisimulate, use aliyun)
 #     PYTORCH_MIRROR= https://mirrors.aliyun.com/pytorch-wheels/
+#     SCCACHE_ENDPOINT / SCCACHE_BUCKET / SCCACHE_REGION (optional) - the
+#       internal MinIO (S3-compatible) backend for the sccache compile cache,
+#       e.g. SCCACHE_ENDPOINT=http://minio.1xtoken-data.svc.cluster.local,
+#       SCCACHE_BUCKET=dynamo-sccache, SCCACHE_REGION=us-east-1. All three
+#       plus the SCCACHE_ACCESS_KEY/SCCACHE_SECRET_KEY secrets above are
+#       required to enable sccache.
 #
 # The ZOT registry is served over plain HTTP on :5000, so the buildkit builder
 # is created with an insecure (http=true, insecure=true) registry block and
 # credentials are written directly to ~/.docker/config.json (bypassing
 # `docker login`, which would otherwise attempt an HTTPS handshake and fail).
+#
+# Layer-cache mirror: every build imports `--cache-from` and exports
+# `--cache-to type=registry,mode=max` to
+# ${ZOT_REGISTRY}/${ZOT_REPOSITORY}/buildcache:<variant> (see the Build and
+# push step). The rendered Dockerfile pins every third-party ref, so with a
+# healthy buildkitd the wheel_builder_base chain is layer-cached anyway; the
+# registry mirror makes the cache INDEPENDENT of buildkitd's local disk
+# (400Gi PVC, GC maxUsedSpace 380GB) — after a GC eviction, a buildkitd
+# restart, or a full cache wipe, the next build recovers the pinned layers
+# from ZOT in minutes instead of recompiling ffmpeg/UCX/libfabric/dnf (~1h).
+# Cache mounts (cargo registry/target, pip, dnf) are NOT exported by mode=max —
+# only layer records are; those still depend on buildkitd local state.
 
 name: Internal Build & Push
 
@@ -255,51 +278,102 @@ jobs:
           PYPI_INDEX: ${{ env.PYPI_INDEX }}
         run: |
           set -ueo pipefail
-          # render.py needs pyyaml + jinja2. The runner's python3 has NO pip and
-          # NO uv ("No module named pip"), and the host package manager reaches
-          # only foreign apt. Bootstrap a static `uv` binary from its GitHub
-          # release via the domestic gh-proxy (public repo astral-sh/uv, no
-          # token), then use uv to install the two deps from the domestic PyPI
-          # mirror. uv is a single ~10MB tarball — well under the RST window.
+          # render.py needs pyyaml + jinja2. The runner's python3 has NO pip
+          # and NO uv ("No module named pip"), and the host package manager
+          # reaches only foreign apt. A static `uv` binary installs the two
+          # deps from the domestic PyPI mirror.
+          #
+          # Runner pods are EPHEMERAL (fresh $HOME per job), so the uv binary
+          # and the render venv live on the shared /cache volume — same pattern
+          # as the repo mirror in the checkout step — keyed by a marker that
+          # encodes the uv tag + dep list. Rebuild only when the marker is
+          # missing/stale (first run, bump, cache wipe); otherwise this step
+          # is a zero-download version check. This matters because the uv
+          # tarball comes through gh-proxy, whose GitHub-asset path 403s for
+          # minutes at a time under shared-IP rate limits — enough to fail a
+          # whole run even with the 20x retry loop.
+          UV_TAG="0.12.8"
+          UV_KEY="uv-${UV_TAG}+deps=pyyaml,jinja2"
+          RENDER_CACHE="/cache/render-tools"
+          if [ ! -d /cache ] || [ ! -w /cache ]; then
+            echo "::notice::no persistent /cache volume — render deps re-download every run"
+            RENDER_CACHE="${HOME}/render-tools"
+          fi
+          MARKER="${RENDER_CACHE}/${UV_KEY}"
+          mkdir -p "${RENDER_CACHE}/bin" "${RENDER_CACHE}/venv"
+
+          if [ -f "${MARKER}" ] && [ -x "${RENDER_CACHE}/bin/uv" ] \
+             && [ -x "${RENDER_CACHE}/venv/bin/python3" ]; then
+            export VIRTUAL_ENV="${RENDER_CACHE}/venv"
+            export PATH="${RENDER_CACHE}/bin:${VIRTUAL_ENV}/bin:$PATH"
+            echo "${RENDER_CACHE}/bin" >> "$GITHUB_PATH"
+            echo "${VIRTUAL_ENV}/bin" >> "$GITHUB_PATH"
+            uv --version
+            python3 -c "import yaml, jinja2; print('render deps OK (cached)')"
+            exit 0
+          fi
+
+          # Cache miss: pull uv from the unauthenticated domestic PyPI mirror
+          # (aliyun) WHEEL — gh-proxy's GitHub-asset path 403s under shared-IP
+          # rate limits and has killed whole runs for minutes at a time. The
+          # wheel bundles the standalone uv ELF binary; python3's stdlib
+          # zipfile extracts it without needing pip on the runner.
           case "$(uname -m)" in
-            x86_64)  UV_ASSET="uv-x86_64-unknown-linux-gnu.tar.gz" ;;
-            aarch64) UV_ASSET="uv-aarch64-unknown-linux-gnu.tar.gz" ;;
+            x86_64)  ARCH_TAG="x86_64" ;;
+            aarch64) ARCH_TAG="aarch64" ;;
             *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;;
           esac
-          UV_TAG="0.12.8"
-          UV_URL="${GH_PROXY}/https://github.com/astral-sh/uv/releases/download/${UV_TAG}/${UV_ASSET}"
-          mkdir -p "$HOME/.local/bin"
+          INDEX_URL="${PYPI_INDEX%/}/uv/"
+          # The simple-API page lists relative hrefs like
+          # "../../packages/<hash>/uv-<tag>-py3-none-manylinux_<ml>_<arch>.whl#sha256=...".
+          # Manylinux (glibc) wheel only; macosx/musllinux wheels fall outside
+          # the pattern.
+          WHEEL_HREF=$(curl -fsSL --connect-timeout 10 --max-time 30 "${INDEX_URL}" \
+            | grep -oE 'href="\.\./\.\./packages/[^"#]*uv-'"${UV_TAG}"'-py3-none-manylinux_[^"#]*_'"${ARCH_TAG}"'\.whl' \
+            | sort -V | tail -1 \
+            | sed -E 's/^href=//; s/^"//; s/"$//; s/#.*$//')
+          [ -n "${WHEEL_HREF}" ] \
+            || { echo "::error::no uv ${UV_TAG} manylinux wheel for ${ARCH_TAG} on ${INDEX_URL}"; exit 1; }
+          UV_URL=$(python3 -c "import sys, urllib.parse as u; print(u.urljoin(sys.argv[1], sys.argv[2]))" \
+            "${INDEX_URL}" "${WHEEL_HREF}")
           ok=0
-          for i in $(seq 1 20); do
-            echo "fetching uv ${UV_TAG} (attempt ${i}/20)"
-            if curl -fL --connect-timeout 20 --max-time 120 -o /tmp/uv.tgz "$UV_URL"; then
+          for i in $(seq 1 10); do
+            echo "fetching uv ${UV_TAG} (attempt ${i}/10) <- ${UV_URL}"
+            if curl -fL --connect-timeout 20 --max-time 120 -o /tmp/uv.whl "$UV_URL"; then
               ok=1; break
             fi
-            echo "::warning::uv download ${i}/20 failed; retry in 3s"
+            echo "::warning::uv download ${i}/10 failed; retry in 3s"
             sleep 3
           done
-          [ $ok -eq 1 ] || { echo "::error::failed to download uv after 20 attempts"; exit 1; }
-          tar -xzf /tmp/uv.tgz -C /tmp
-          install -m 0755 /tmp/uv-*/uv "$HOME/.local/bin/uv"
-          export PATH="$HOME/.local/bin:$PATH"
+          [ $ok -eq 1 ] \
+            || { echo "::error::failed to download uv after 10 attempts"; exit 1; }
+          # PEP 427: wheel payload sits at <distname>.data/scripts/.
+          rm -rf /tmp/uv-extracted
+          python3 -m zipfile -e /tmp/uv.whl /tmp/uv-extracted
+          install -m 0755 /tmp/uv-extracted/uv-*.data/scripts/uv "${RENDER_CACHE}/bin/uv"
+          export PATH="${RENDER_CACHE}/bin:$PATH"
           uv --version
-          # Probe the domestic index first so the log shows whether tuna is
-          # reachable and serving pyyaml from this runner's network.
+          # Probe the domestic index first so the log shows whether the mirror
+          # is reachable and serving pyyaml from this runner's network.
           curl -fsS --connect-timeout 10 -o /dev/null \
-            -w "pyidx probe: tuna/PyYAML -> HTTP %{http_code}\n" \
+            -w "pyidx probe: PyYAML -> HTTP %{http_code}\n" \
             "$PYPI_INDEX/pyyaml/" \
-            || echo "pyidx probe: tuna PyYAML unreachable or non-200"
-          # Install into a user-writable venv (the runner runs as a non-root
-          # user, so --system into /usr/local/lib is Permission denied). Put the
-          # venv bin on GITHUB_PATH so later steps' `python3` runs the venv
-          # python that has pyyaml+jinja2.
-          VENV="$HOME/dynamo-render-venv"
+            || echo "pyidx probe: PyYAML unreachable or non-200"
+          # (Re)build the venv at the cached location: a fixed absolute path
+          # keeps venv shebangs/entrypoints valid across runner pods.
+          VENV="${RENDER_CACHE}/venv"
+          # uv refuses a non-empty venv dir; empty it for a clean rebuild.
+          find "$VENV" -mindepth 1 -delete
           uv venv "$VENV"
           export VIRTUAL_ENV="$VENV"
           export PATH="$VENV/bin:$PATH"
-          echo "$VENV/bin" >> "$GITHUB_PATH"
           uv pip install --default-index "$PYPI_INDEX" pyyaml jinja2
           python3 -c "import yaml, jinja2; print('render deps OK')"
+          : > "${MARKER}"
+          # Put the venv bin on GITHUB_PATH so later steps' bare `python3`
+          # resolves the venv python that has pyyaml+jinja2.
+          echo "${RENDER_CACHE}/bin" >> "$GITHUB_PATH"
+          echo "$VENV/bin" >> "$GITHUB_PATH"
 
       - name: Compute image tags
         id: tag
@@ -399,6 +473,15 @@ jobs:
         # so the per-run GITHUB_TOKEN no longer rotates the build cache keys.
         env:
           BUILD_PROXY: ${{ vars.BUILD_PROXY }}
+          # sccache MinIO backend (all-or-nothing, same gate as the build
+          # step). the rewriter only injects the MinIO wiring when the full
+          # config exists, so an unconfigured repo renders a byte-identical
+          # Dockerfile and keeps its layer cache.
+          SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          SCCACHE_ACCESS_KEY: ${{ secrets.SCCACHE_ACCESS_KEY }}
+          SCCACHE_SECRET_KEY: ${{ secrets.SCCACHE_SECRET_KEY }}
         run: |
           set -ueo pipefail
           DF="container/rendered.Dockerfile"
@@ -408,6 +491,12 @@ jobs:
             | grep -Ev 'gh-proxy\.com|rsproxy\.cn|mirrors\.tuna|github\.com/ai-dynamo|nvcr\.io|quay\.io|ghcr\.io' \
             || true
           echo "::endgroup::"
+
+          if [ -n "${SCCACHE_ENDPOINT}" ] && [ -n "${SCCACHE_BUCKET}" ] && [ -n "${SCCACHE_REGION}" ] \
+             && [ -n "${SCCACHE_ACCESS_KEY}" ] && [ -n "${SCCACHE_SECRET_KEY}" ]; then
+            export RENDER_SCCACHE_MINIO=1
+            echo "sccache: rewriter will retarget the compile cache at MinIO (${SCCACHE_ENDPOINT})"
+          fi
 
           # Mirror rewriting (github->gh-proxy, pypi/rustup/pytorch->domestic
           # mirrors, base images->orc, git-clone retry-wrap, apt/dnf mirror
@@ -486,6 +575,24 @@ jobs:
           NO_CACHE: ${{ inputs.no_cache || false }}
           PIP_INDEX_URL: ${{ env.PYPI_INDEX }}
           UV_DEFAULT_INDEX: ${{ env.PYPI_INDEX }}
+          # Per-variant build cache repo in ZOT. The ref's registry is the same
+          # ZOT host buildkitd already treats as http+insecure, and buildx
+          # forwards the ~/.docker/config.json auth for cache-from/cache-to to
+          # it just as it does for the image push.
+          CACHE_REF: ${{ env.ZOT_REGISTRY }}/${{ env.ZOT_REPOSITORY }}/buildcache
+          VARIANT: ${{ steps.tag.outputs.name }}
+          # sccache MinIO backend. The rewrite step above retargeted the
+          # Dockerfile's sccache RUN steps at static S3 keys + endpoint; this
+          # step must pass the matching --build-arg/--secret set. Enable only
+          # when the full config exists (same gate as the rewrite step) — a
+          # missing piece would otherwise start the sccache server without
+          # credentials (use-sccache.sh then silently degrades to uncached
+          # compilation).
+          SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          SCCACHE_ACCESS_KEY: ${{ secrets.SCCACHE_ACCESS_KEY }}
+          SCCACHE_SECRET_KEY: ${{ secrets.SCCACHE_SECRET_KEY }}
         run: |
           set -euo pipefail
           METADATA="${RUNNER_TEMP}/internal-build-metadata.json"
@@ -509,8 +616,39 @@ jobs:
             [[ "$ARG" =~ ^[[:space:]]*$ ]] && continue
             ARGS+=(--build-arg "$ARG")
           done <<< "$EXTRA_BUILD_ARGS"
+          # sccache: enable only with a complete MinIO backend config — the
+          # endpoint/bucket/region variables AND the access key pair. The
+          # rewriter already swapped the RUN secrets to aws AWS_ACCESS_KEY_ID
+          # / AWS_SECRET_ACCESS_KEY env mounts, and USE_SCCACHE/SCCACHE_* are
+          # passed through to the stages that wrap the compilers
+          # (Rust/ffmpeg/UCX/libfabric). With any input missing, skip
+          # explicitly so the run log states why compilation runs uncached
+          # instead of silently doing so.
+          if [ -n "${SCCACHE_ENDPOINT}" ] && [ -n "${SCCACHE_BUCKET}" ] && [ -n "${SCCACHE_REGION}" ] \
+             && [ -n "${SCCACHE_ACCESS_KEY}" ] && [ -n "${SCCACHE_SECRET_KEY}" ]; then
+            ARGS+=(--build-arg "USE_SCCACHE=true")
+            ARGS+=(--build-arg "SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT}")
+            ARGS+=(--build-arg "SCCACHE_BUCKET=${SCCACHE_BUCKET}")
+            ARGS+=(--build-arg "SCCACHE_REGION=${SCCACHE_REGION}")
+            ARGS+=(--secret id=s3-access-key,env=SCCACHE_ACCESS_KEY)
+            ARGS+=(--secret id=s3-secret-key,env=SCCACHE_SECRET_KEY)
+            echo "sccache: enabled (minio ${SCCACHE_ENDPOINT}, bucket=${SCCACHE_BUCKET})"
+          else
+            echo "::notice::sccache disabled - set secrets SCCACHE_ACCESS_KEY + SCCACHE_SECRET_KEY and variables SCCACHE_ENDPOINT + SCCACHE_BUCKET + SCCACHE_REGION to enable the MinIO compile cache."
+          fi
           if [ "$NO_CACHE" = "true" ]; then
             ARGS+=(--no-cache)
+          else
+            # Import the registry-cache mirror before the solve, then export
+            # every intermediate record (mode=max) after it. First run on a
+            # fresh variant: the cache-from ref does not exist yet — buildkit
+            # logs a non-fatal warning and builds forward. ignore-error keeps a
+            # cache-upload failure (registry hiccup, quota) from failing the
+            # build: the image push above is the deliverable, the cache is an
+            # optimization. Skipped under no_cache so a forced-fresh build does
+            # not read from the mirror it is meant to bypass.
+            ARGS+=(--cache-from "type=registry,ref=${CACHE_REF}:${VARIANT}")
+            ARGS+=(--cache-to "type=registry,ref=${CACHE_REF}:${VARIANT},mode=max,ignore-error=true")
           fi
           "${ARGS[@]}" .
           DIGEST="$(jq -er '."containerimage.digest" | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' "$METADATA")"

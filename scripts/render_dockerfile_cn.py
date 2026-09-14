@@ -16,7 +16,13 @@ hosts.
 Env vars consumed (all required unless noted):
   GH_PROXY, RS_PROXY, APT_MIRROR, DNF_MIRROR, PYTORCH_MIRROR,
   BASE_IMAGE_REF, WHEEL_BUILDER_IMAGE_REF, UV_IMAGE_REF,
-  BUILD_PROXY (optional, "" = direct egress).
+  BUILD_PROXY (optional, "" = direct egress),
+  RENDER_SCCACHE_MINIO (optional, "1" = retarget the in-image sccache
+    compile cache from AWS web-identity auth to the internal MinIO:
+    replaces the aws-web-identity-token/aws-role-arn secret mounts with
+    static S3 access keys and plumbs SCCACHE_ENDPOINT through. Kept
+    conditional so an unconfigured repo renders a byte-identical
+    Dockerfile and its layer cache survives).
 """
 
 import os
@@ -72,6 +78,51 @@ def _wrap_fetch(m):
         f"do _n=$((_n+1)); [ $_n -ge 8 ] && exit 1; "
         f"echo git_fetch_retry_$_n; sleep $((_n*4)); done; }}"
     )
+
+
+def _sccache_minio(s):
+    """Retarget the sccache RUN steps from AWS web-identity to static MinIO keys.
+
+    The upstream templates authenticate sccache's S3 backend with AWS IRSA
+    (web-identity token file + role ARN secret) and only know SCCACHE_BUCKET /
+    SCCACHE_REGION. The internal MinIO is plain HTTP on a cluster service and
+    uses static access keys, so swap the two aws-* secret mounts for an
+    AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY pair, drop the token-file export,
+    and declare SCCACHE_ENDPOINT alongside the other two SCCACHE args.
+    """
+    # The mounts: replace the AWS web-identity pair with static S3 keys. The
+    # pair leads the RUN in the ffmpeg/UCX/libfabric steps; in the maturin
+    # step it follows the pypi-netrc mount — matching just the two mount
+    # lines (no RUN anchor) covers both.
+    s = s.replace(
+        "--mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \\\n"
+        "    --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \\\n",
+        "--mount=type=secret,id=s3-access-key,env=AWS_ACCESS_KEY_ID \\\n"
+        "    --mount=type=secret,id=s3-secret-key,env=AWS_SECRET_ACCESS_KEY \\\n",
+    )
+    # The token-file export: drop it wherever it sits in the preamble (it
+    # directly follows the mounts in most steps, after the NETRC export in
+    # the maturin one). With static keys the AWS SDK reads the env mounts.
+    s = s.replace(
+        "    export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \\\n",
+        "",
+    )
+    s = s.replace(
+        'ARG SCCACHE_REGION=""\n',
+        'ARG SCCACHE_REGION=""\nARG SCCACHE_ENDPOINT=""\n',
+    )
+    s = s.replace(
+        "ARG SCCACHE_REGION\n",
+        "ARG SCCACHE_REGION\nARG SCCACHE_ENDPOINT\n",
+    )
+    s = s.replace(
+        "ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET}} \\\n"
+        "    SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION}}",
+        "ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET}} \\\n"
+        "    SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION}} \\\n"
+        "    SCCACHE_ENDPOINT=${USE_SCCACHE:+${SCCACHE_ENDPOINT}}",
+    )
+    return s
 
 
 def rewrite(s):
@@ -270,6 +321,12 @@ def rewrite(s):
         _wrap_fetch,
         s,
     )
+
+    # 8) sccache-on-MinIO (opt-in, set by the workflow only when the full
+    #    MinIO config exists): keeps unconfigured builds byte-identical so
+    #    their layer cache keys do not shift.
+    if os.environ.get("RENDER_SCCACHE_MINIO", "") == "1":
+        s = _sccache_minio(s)
 
     return s
 

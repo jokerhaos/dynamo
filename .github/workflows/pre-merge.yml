@@ -189,12 +189,23 @@ jobs:
           python3 -m venv "$HOME/venv"
           "$HOME/venv/bin/pip" install --quiet pre-commit
           echo "$HOME/venv/bin" >> "$GITHUB_PATH"
-      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
-        # Hook-env init (isort/black/flake8/clang-format...) clones their
-        # upstream repos when the pre-commit cache layer misses — allow
-        # headroom for a cold cache plus slow clone, instead of the 15m
-        # that timed out mid clang-format init.
+      - name: Run pre-commit (all files)
+        # Bypass pre-commit/action: its bundled actions/cache round-trips
+        # the 78MB hook-env archive through the painfully slow GitHub cache
+        # service (~0.4MB/s here) and, on restore timeouts, falls into a
+        # cold re-init. Keep hook environments on the persistent /cache
+        # volume instead — restored from local disk in seconds and shared
+        # across runs. First run seeds it via gh-proxy clones (else-branch
+        # keeps the ephemeral-pod default when /cache is absent).
         timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            mkdir -p /cache/pre-commit
+            export PRE_COMMIT_HOME=/cache/pre-commit
+            echo "PRE_COMMIT_HOME=/cache/pre-commit (persistent volume)"
+          fi
+          "$HOME/venv/bin/pre-commit" run --show-diff-on-failure --color=always --all-files
 
   rust:
     needs: changed-files

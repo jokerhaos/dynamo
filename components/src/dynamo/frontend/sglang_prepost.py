@@ -1025,6 +1025,7 @@ class SglangStreamingPostProcessor:
         prompt_token_ids: list[int] | None = None,
         stop_strings: set[str] | None = None,
         stop_token_ids: set[int] | None = None,
+        tool_stream: bool = True,
     ) -> None:
         self.tokenizer = tokenizer
         self.tool_call_parser = tool_call_parser
@@ -1035,6 +1036,11 @@ class SglangStreamingPostProcessor:
             tool_call_parser_name
         )
         self._named_zero_arg_tool = named_zero_arg_tool
+        # tool_stream=False restores the legacy delivery shape: argument
+        # deltas are withheld and the fully assembled call is emitted in
+        # the single finish frame.  Wired from DYN_SGLANG_TOOL_STREAM in
+        # the processor.
+        self._tool_stream = tool_stream
         self._fast_plain_text = tool_call_parser is None and reasoning_parser is None
         # Preserve special tokens when a parser is active so tool-call and
         # reasoning delimiters remain visible during incremental decoding.
@@ -1577,7 +1583,10 @@ class SglangStreamingPostProcessor:
                 # reconciliation below, which re-validates them against
                 # the re-parsed call so malformed or misidentified calls
                 # are never emitted on the same wire path they are dropped.
-                if not finish_reason:
+                # tool_stream=False keeps the legacy shape instead: hold
+                # everything and let the reconciliation emit the complete
+                # assembled call at finish.
+                if self._tool_stream and not finish_reason:
                     entry = self._streaming_tool_delta_entry(idx, tc)
                     if entry is not None:
                         tool_stream_deltas.append(entry)

@@ -937,6 +937,16 @@ def _qwen_guided_request_without_separation(tool_choice):
     return request
 
 
+def _plain_reasoning_request(enable_thinking: bool | None = None):
+    request = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    }
+    if enable_thinking is not None:
+        request["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+    return request
+
+
 @pytest.mark.parametrize(
     "tool_choice",
     [
@@ -1070,6 +1080,80 @@ def test_qwen_separate_reasoning_false_sets_gate_pool(
     assert result.force_reasoning is True
     assert result.dynamo_preproc["require_reasoning"] is True
     assert result.effective_reasoning_parser_name is None
+
+
+def test_plain_reasoning_request_sets_engine_gate_inline(tokenizer):
+    """A no-tools thinking request asks the engine to reason, so its
+    meta_info.reasoning_tokens is accounted instead of staying 0."""
+    routed_engine = FakeRoutedEngine(items=[{"token_ids": [], "finish_reason": "stop"}])
+    processor = SglangProcessor(
+        tokenizer=tokenizer,
+        routed_engine=routed_engine,
+        tool_call_parser_name="qwen25",
+        reasoning_parser_name="qwen3",
+        eos_token_ids=None,
+    )
+
+    async def collect():
+        return [item async for item in processor.generator(_plain_reasoning_request())]
+
+    asyncio.run(collect())
+    assert routed_engine.requests[0]["require_reasoning"] is True
+
+
+def test_thinking_disabled_request_leaves_engine_gate_off_inline(tokenizer):
+    """Opting out of thinking must not label plain output as reasoning (the
+    engine counter attributes every token to reasoning once started)."""
+    routed_engine = FakeRoutedEngine(items=[{"token_ids": [], "finish_reason": "stop"}])
+    processor = SglangProcessor(
+        tokenizer=tokenizer,
+        routed_engine=routed_engine,
+        tool_call_parser_name="qwen25",
+        reasoning_parser_name="qwen3",
+        eos_token_ids=None,
+    )
+
+    async def collect():
+        return [
+            item
+            async for item in processor.generator(
+                _plain_reasoning_request(enable_thinking=False)
+            )
+        ]
+
+    asyncio.run(collect())
+    assert routed_engine.requests[0]["require_reasoning"] is False
+
+
+def test_plain_reasoning_request_sets_engine_gate_pool(tokenizer, monkeypatch):
+    """Pool preprocessing forwards the same engine reasoning gate."""
+    monkeypatch.setattr(sglang_processor_module, "_w_tokenizer", tokenizer)
+    monkeypatch.setattr(sglang_processor_module, "_w_tool_call_parser_name", "qwen25")
+    monkeypatch.setattr(sglang_processor_module, "_w_reasoning_parser_name", "qwen3")
+    monkeypatch.setattr(
+        sglang_processor_module, "_w_exclude_tools_when_tool_choice_none", True
+    )
+    monkeypatch.setattr(sglang_processor_module, "_w_template_force_reasoning", False)
+
+    result = _preprocess_worker(_plain_reasoning_request(), MODEL, eos_token_ids=None)
+    assert result.force_reasoning is True
+    assert result.dynamo_preproc["require_reasoning"] is True
+
+
+def test_thinking_disabled_request_leaves_engine_gate_off_pool(tokenizer, monkeypatch):
+    monkeypatch.setattr(sglang_processor_module, "_w_tokenizer", tokenizer)
+    monkeypatch.setattr(sglang_processor_module, "_w_tool_call_parser_name", "qwen25")
+    monkeypatch.setattr(sglang_processor_module, "_w_reasoning_parser_name", "qwen3")
+    monkeypatch.setattr(
+        sglang_processor_module, "_w_exclude_tools_when_tool_choice_none", True
+    )
+    monkeypatch.setattr(sglang_processor_module, "_w_template_force_reasoning", False)
+
+    result = _preprocess_worker(
+        _plain_reasoning_request(enable_thinking=False), MODEL, eos_token_ids=None
+    )
+    assert result.force_reasoning is False
+    assert result.dynamo_preproc["require_reasoning"] is False
 
 
 @pytest.mark.parametrize(

@@ -69,6 +69,13 @@ env:
 jobs:
   changed-files:
     runs-on: 0xtoken-arc-runner-set
+    # tj-actions/changed-files lists changed files via the PR REST API
+    # (GET /pulls/{n}/files), which needs pull-requests: read on the job
+    # token — without it the API 403s with "Resource not accessible by
+    # integration".
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       rust: ${{ steps.changes.outputs.rust }}
     steps:
@@ -86,9 +93,19 @@ jobs:
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
           seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" --filter=blob:none "$url" "$MIRROR"; }
-          fetch_sha(){ git -C "$MIRROR" fetch --filter=blob:none --depth "$DEPTH" --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
+          fetch_sha(){
+            find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
+            git -C "$MIRROR" fetch --filter=blob:none --depth "$DEPTH" --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
+          }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            # Serialize runs sharing this mirror and self-heal stale
+            # .git/*.lock: cancel-in-progress kills jobs mid-fetch, which
+            # otherwise wedges every later run on this volume until the
+            # lock files are removed. Holding the flock makes that safe.
+            MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
+            exec 9>"$MLOCK"
+            if command -v flock >/dev/null 2>&1; then flock 9; fi
             MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
@@ -136,9 +153,19 @@ jobs:
           # (validate-skills → .agents/skills, the docs/fern/* scripts, default
           # trailing-whitespace/EOF hooks).
           seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 "$url" "$MIRROR"; }
-          fetch_sha(){ git -C "$MIRROR" fetch --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
+          fetch_sha(){
+            find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
+            git -C "$MIRROR" fetch --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
+          }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            # Serialize runs sharing this mirror and self-heal stale
+            # .git/*.lock: cancel-in-progress kills jobs mid-fetch, which
+            # otherwise wedges every later run on this volume until the
+            # lock files are removed. Holding the flock makes that safe.
+            MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
+            exec 9>"$MLOCK"
+            if command -v flock >/dev/null 2>&1; then flock 9; fi
             MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
@@ -155,13 +182,36 @@ jobs:
           fi
       - name: Install python3-venv (sudo; pod is ephemeral, no base-image pollution)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-venv
+      - name: Route github clones through gh-proxy (hook envs clone from github.com)
+        run: git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
       - name: Install pre-commit into a venv
         run: |
           python3 -m venv "$HOME/venv"
           "$HOME/venv/bin/pip" install --quiet pre-commit
           echo "$HOME/venv/bin" >> "$GITHUB_PATH"
-      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
-        timeout-minutes: 15
+      - name: Run pre-commit (all files)
+        # Bypass pre-commit/action: its bundled actions/cache round-trips
+        # the 78MB hook-env archive through the painfully slow GitHub cache
+        # service (~0.4MB/s here) and, on restore timeouts, falls into a
+        # cold re-init. Keep hook environments on the persistent /cache
+        # volume instead — restored from local disk in seconds and shared
+        # across runs. First run seeds it via gh-proxy clones (else-branch
+        # keeps the ephemeral-pod default when /cache is absent).
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            # /cache itself is root-owned; /cache/repos is the pre-made
+            # writable subvolume. Provision /cache/pre-commit once via the
+            # runner's passwordless sudo (same trust level as the apt step).
+            if [ ! -d /cache/pre-commit ] || [ ! -w /cache/pre-commit ]; then
+              sudo mkdir -p /cache/pre-commit
+              sudo chown "$(id -u):$(id -g)" /cache/pre-commit
+            fi
+            export PRE_COMMIT_HOME=/cache/pre-commit
+            echo "PRE_COMMIT_HOME=/cache/pre-commit (persistent volume)"
+          fi
+          "$HOME/venv/bin/pre-commit" run --show-diff-on-failure --color=always --all-files
 
   rust:
     needs: changed-files
@@ -193,9 +243,19 @@ jobs:
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
           seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 --filter=blob:none "$url" "$MIRROR"; }
-          fetch_sha(){ git -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
+          fetch_sha(){
+            find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
+            git -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
+          }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
+            # Serialize runs sharing this mirror and self-heal stale
+            # .git/*.lock: cancel-in-progress kills jobs mid-fetch, which
+            # otherwise wedges every later run on this volume until the
+            # lock files are removed. Holding the flock makes that safe.
+            MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
+            exec 9>"$MLOCK"
+            if command -v flock >/dev/null 2>&1; then flock 9; fi
             MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
@@ -229,6 +289,15 @@ jobs:
             '[net]' 'git-fetch-with-cli = true' \
             > "$HOME/.cargo/config.toml"
       - name: Install Rust toolchain from rsproxy
+        # Without RUSTUP_DIST_SERVER rustup downloads toolchains from
+        # static.rust-lang.org, which this runner cannot reach — the step
+        # hangs forever instead of failing. Point every rustup download
+        # at the rsproxy mirror and bound the step so a wedged download
+        # fails loudly instead of stalling the job.
+        env:
+          RUSTUP_DIST_SERVER: https://rsproxy.cn
+          RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
+        timeout-minutes: 20
         run: |
           if ! command -v rustc >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \

@@ -4334,7 +4334,10 @@ class TestReasoningParsing:  # FRONTEND.9 — reasoning ↔ tool-call orchestrat
         token_ids = case_tokenizer.encode(text)
         reasoning = ""
         content = ""
-        tool_calls = []
+        # Assemble tool_calls the way an OpenAI client does: id/name from
+        # the first frame that carries them, argument fragments concatenated
+        # per index.
+        tool_calls: dict[int, dict] = {}
         finish_reason = None
         for offset in range(0, len(token_ids), 3):
             batch = token_ids[offset : offset + 3]
@@ -4346,17 +4349,26 @@ class TestReasoningParsing:  # FRONTEND.9 — reasoning ↔ tool-call orchestrat
                 delta = choice.get("delta", {})
                 reasoning += delta.get("reasoning_content", "")
                 content += delta.get("content", "")
-                tool_calls.extend(delta.get("tool_calls", []))
+                for entry in delta.get("tool_calls", []):
+                    idx = entry.get("index", 0)
+                    merged = tool_calls.setdefault(idx, {"function": {}})
+                    if entry.get("id"):
+                        merged["id"] = entry["id"]
+                    fn = entry.get("function") or {}
+                    if fn.get("name"):
+                        merged["function"]["name"] = fn["name"]
+                    merged["function"]["arguments"] = merged["function"].get(
+                        "arguments", ""
+                    ) + (fn.get("arguments") or "")
                 finish_reason = choice.get("finish_reason") or finish_reason
 
+        assembled = [tool_calls[idx] for idx in sorted(tool_calls)]
         assert reasoning == expected_reasoning
         assert content == ""
         assert finish_reason == "tool_calls"
-        assert len(tool_calls) == 1
-        assert tool_calls[0]["function"]["name"] == "get_weather"
-        assert json.loads(tool_calls[0]["function"]["arguments"]) == {
-            "city": "New York"
-        }
+        assert len(assembled) == 1
+        assert assembled[0]["function"]["name"] == "get_weather"
+        assert json.loads(assembled[0]["function"]["arguments"]) == {"city": "New York"}
 
 
 # ---------------------------------------------------------------------------
@@ -4366,6 +4378,45 @@ class TestReasoningParsing:  # FRONTEND.9 — reasoning ↔ tool-call orchestrat
 
 class TestUtilities:  # (mixed — see per-test annotations)
     """Test shared utility functions."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, True),
+            ("1", True),
+            ("true", True),
+            ("TRUE", True),
+            (" on ", True),
+            ("yes", True),
+            ("0", False),
+            ("false", False),
+            ("False", False),
+            ("off", False),
+            ("no", False),
+        ],
+    )
+    def test_parse_tool_stream_env(self, raw, expected):  # FRONTEND.4
+        """DYN_SGLANG_TOOL_STREAM parsing: default true, bool-ish words."""
+        assert sglang_processor_module._parse_tool_stream_env(raw) is expected
+
+    def test_parse_tool_stream_env_invalid_warns(self):  # FRONTEND.4
+        """An unparseable value warns and keeps the streaming default."""
+        assert sglang_processor_module._parse_tool_stream_env("maybe") is True
+
+    def test_processor_reads_tool_stream_env(
+        self, tokenizer, monkeypatch
+    ):  # FRONTEND.1
+        """SglangProcessor picks up DYN_SGLANG_TOOL_STREAM at construction."""
+        routed_engine = FakeRoutedEngine(items=[])
+        monkeypatch.setenv("DYN_SGLANG_TOOL_STREAM", "false")
+        processor = SglangProcessor(
+            tokenizer=tokenizer,
+            routed_engine=routed_engine,
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_ids=None,
+        )
+        assert processor.tool_stream is False
 
     def test_random_uuid_format(self):  # FRONTEND.4
         """random_uuid produces 16-char hex string."""

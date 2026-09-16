@@ -201,7 +201,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
-            mkdir -p /cache/pre-commit
+            # /cache itself is root-owned; /cache/repos is the pre-made
+            # writable subvolume. Provision /cache/pre-commit once via the
+            # runner's passwordless sudo (same trust level as the apt step).
+            if [ ! -d /cache/pre-commit ] || [ ! -w /cache/pre-commit ]; then
+              sudo mkdir -p /cache/pre-commit
+              sudo chown "$(id -u):$(id -g)" /cache/pre-commit
+            fi
             export PRE_COMMIT_HOME=/cache/pre-commit
             echo "PRE_COMMIT_HOME=/cache/pre-commit (persistent volume)"
           fi

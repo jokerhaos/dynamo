@@ -166,6 +166,31 @@ class _PostProcessor:
         }
 
 
+def _dynamo_llm_stub_attrs():
+    """Attrs the processor chain resolves from ``dynamo.llm`` at import time.
+
+    Sourced from the real module when the compiled runtime is available so
+    import-time evaluation (guided_json's ``HttpError`` references, ModelType
+    members) behaves; bare placeholders otherwise keep the chain importable
+    in environments without the extension.
+    """
+    attrs = {
+        "ModelCardInstanceId": object,
+        "PythonAsyncEngine": object,
+        "RoutedEngine": object,
+        "HttpError": type("HttpError", (Exception,), {}),
+    }
+    try:
+        import dynamo.llm as real_llm
+    except Exception:  # noqa: BLE001 - placeholder fallback is the point
+        real_llm = None
+    if real_llm is not None:
+        for name in (*attrs, "ModelType"):
+            if hasattr(real_llm, name):
+                attrs[name] = getattr(real_llm, name)
+    return attrs
+
+
 def _load_processor_module(module_stubs):
     install_module, remove_module = module_stubs
     _install_sglang_stubs(install_module)
@@ -180,13 +205,7 @@ def _load_processor_module(module_stubs):
         "dynamo.frontend.frontend_args",
         FrontendConfig=object,
     )
-    _install_module(
-        install_module,
-        "dynamo.llm",
-        ModelCardInstanceId=object,
-        PythonAsyncEngine=object,
-        RoutedEngine=object,
-    )
+    _install_module(install_module, "dynamo.llm", **_dynamo_llm_stub_attrs())
     _install_module(
         install_module,
         "dynamo.llm.exceptions",
@@ -205,6 +224,9 @@ def test_stream_emits_llm_metrics_annotation(module_stubs):
         "completion_tokens": 3,
         "total_tokens": 13,
         "prompt_tokens_details": {"cached_tokens": 4},
+        # Emits exactly what the SGLang decode bridge now builds; the
+        # whole-dict equality below pins the streaming passthrough.
+        "completion_tokens_details": {"reasoning_tokens": 5},
     }
     processor = module.SglangProcessor(
         tokenizer=None,

@@ -266,6 +266,15 @@ jobs:
             '[net]' 'git-fetch-with-cli = true' \
             > "$HOME/.cargo/config.toml"
       - name: Install Rust toolchain from rsproxy
+        # Without RUSTUP_DIST_SERVER rustup downloads toolchains from
+        # static.rust-lang.org, which this runner cannot reach — the step
+        # hangs forever instead of failing. Point every rustup download
+        # at the rsproxy mirror and bound the step so a wedged download
+        # fails loudly instead of stalling the job.
+        env:
+          RUSTUP_DIST_SERVER: https://rsproxy.cn
+          RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
+        timeout-minutes: 20
         run: |
           if ! command -v rustc >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \

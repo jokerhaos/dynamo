@@ -182,13 +182,19 @@ jobs:
           fi
       - name: Install python3-venv (sudo; pod is ephemeral, no base-image pollution)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-venv
+      - name: Route github clones through gh-proxy (hook envs clone from github.com)
+        run: git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
       - name: Install pre-commit into a venv
         run: |
           python3 -m venv "$HOME/venv"
           "$HOME/venv/bin/pip" install --quiet pre-commit
           echo "$HOME/venv/bin" >> "$GITHUB_PATH"
       - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd  # v3.0.1
-        timeout-minutes: 15
+        # Hook-env init (isort/black/flake8/clang-format...) clones their
+        # upstream repos when the pre-commit cache layer misses — allow
+        # headroom for a cold cache plus slow clone, instead of the 15m
+        # that timed out mid clang-format init.
+        timeout-minutes: 25
 
   rust:
     needs: changed-files

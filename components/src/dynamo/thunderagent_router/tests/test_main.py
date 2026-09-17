@@ -127,7 +127,11 @@ class FakeKvRouter:
         self.chunks = chunks if chunks is not None else []
         self.sent: Optional[dict[str, Any]] = None
 
-    async def generate_from_request(self, preprocessed):
+    async def generate_from_request(self, preprocessed, context=None):
+        # The handler forwards the inbound context (request identity,
+        # cancellation, tracing) alongside the request, mirroring the
+        # standalone router.
+        self.context = context
         self.sent = preprocessed
 
         async def stream():

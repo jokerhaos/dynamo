@@ -449,7 +449,15 @@ def _new_decode_handler(*, enable_frontend_decoding: bool):
 
     @asynccontextmanager
     async def no_cancellation_monitor(*args, **kwargs):
-        yield None
+        async def wait_forever():
+            await asyncio.Future()
+
+        task = asyncio.create_task(wait_forever())
+        try:
+            yield task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     handler._cancellation_monitor = no_cancellation_monitor
 

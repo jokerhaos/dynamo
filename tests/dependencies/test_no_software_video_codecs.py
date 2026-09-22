@@ -145,12 +145,22 @@ def _bundled_libavcodecs() -> list[str]:
 
     A wheel may vendor a complete ffmpeg under its package directory, where the
     ``ffmpeg`` CLI checks above cannot see it. DALI does exactly that.
+
+    torchcodec is the one deliberate exception: the SGLang runtime image ships
+    it because SGLang's sglang.srt.utils.video_decoder selects torchcodec as
+    its primary video-input backend (see container/deps/requirements.sglang.txt
+    and the keep in container/templates/sglang_runtime.Dockerfile). Its wheel
+    vendors an LGPL FFmpeg whose libavcodec registers the software H.264/H.265
+    decoders this module otherwise forbids -- an accepted trade-off for this
+    internal image, asserted as importable at build time instead.
     """
     found: list[str] = []
     for root in {p for p in sys.path if p and os.path.isdir(p)}:
         for dirpath, _dirnames, filenames in os.walk(root):
             if dirpath.startswith("/usr/local/lib") and "/dist-packages" not in dirpath:
                 continue  # our in-tree ffmpeg, covered by the surface checks
+            if f"{os.sep}torchcodec{os.sep}" in dirpath:
+                continue  # shipped on purpose, see docstring
             for name in filenames:
                 if name.startswith("libavcodec") and ".so" in name:
                     found.append(os.path.join(dirpath, name))

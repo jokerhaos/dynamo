@@ -152,6 +152,14 @@ overrides:
     license: LicenseRef-NVIDIA-Proprietary
     source: "NVIDIA NVSHMEM License — https://docs.nvidia.com/nvshmem/api/eula.html"
 
+  # nvshmem4py follows the NVSHMEM SLA (per its PyPI description) but its
+  # wheel METADATA ships no License/Classifier fields, so it resolves to
+  # UNKNOWN without this entry.
+  - ecosystem: python
+    name: nvshmem4py-cu13
+    license: LicenseRef-NVIDIA-Proprietary
+    source: "NVIDIA NVSHMEM License — https://docs.nvidia.com/nvshmem/api/eula.html"
+
   - ecosystem: python
     name: nvidia-cudnn-cu13
     license: LicenseRef-NVIDIA-Proprietary

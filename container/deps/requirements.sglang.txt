@@ -3,13 +3,10 @@
 #
 # Third-party Python dependencies for the SGLang runtime image. Installed with
 # --force-reinstall --no-deps so the upstream SGLang dependency stack remains
-# otherwise unchanged. codec-bearing video-DECODE wheels (av, decord, opencv)
-# are removed separately in sglang_runtime.Dockerfile; the in-tree VP9 ffmpeg +
-# imageio-ffmpeg below are kept for the video-generation encode path.
-# torchcodec is the ONE decode carrier we keep (restored below): SGLang's
-# sglang.srt.utils.video_decoder picks it as its primary backend and has no
-# working video-input path without it. Keep this pin in sync with the SGLang
-# pyproject the base image builds from (v0.5.20 pins torchcodec==0.15.0).
+# otherwise unchanged. Codec-bearing video-DECODE wheels (av, decord, opencv,
+# torchcodec) are removed separately in sglang_runtime.Dockerfile; the in-tree
+# VP9 ffmpeg + imageio-ffmpeg below are kept for the video-generation encode
+# path.
 
 # Install imageio-ffmpeg from source so no prebuilt ffmpeg binary lands in
 # <site-packages>/imageio_ffmpeg/binaries/. IMAGEIO_FFMPEG_EXE (set in
@@ -29,11 +26,4 @@ pillow>=12.3.0,<13  # bounded: this file installs with --force-reinstall
 # libavcodec that the codec gate rejects. Links libnvcuvid at runtime; requires
 # NVIDIA_DRIVER_CAPABILITIES to include "video" (set in sglang_runtime.Dockerfile).
 PyNvVideoCodec>=2.2.0
-# Primary software video-decode backend for SGLang's video input path
-# (video_decoder.py: torchcodec preferred, decord as fallback). The wheel
-# vendors its own (LGPL-2.1-or-later) FFmpeg carrying software H.264/H.265
-# decoders -- accepted for this internal image; the runtime keep is excluded
-# from the codec purge in sglang_runtime.Dockerfile and from the bundled-
-# libavcodec scan in tests/dependencies/test_no_software_video_codecs.py.
-torchcodec==0.15.0
 zstandard==0.23.0

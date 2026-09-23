@@ -187,19 +187,9 @@ RUN --mount=type=bind,source=./container/deps/requirements.sglang.txt,target=/tm
         --requirement /tmp/requirements.sglang.txt
 
 # Remove the codec-bearing video-DECODE components from the upstream SGLang image
-# (PyAV, decord, OpenCV + any base ffmpeg/libav*), then copy the VP9-only
-# in-tree ffmpeg from wheel_builder below for the video-generation encode path.
-# H.264/H.265/AAC encoders must never appear (guarded at the end).
-#
-# torchcodec is deliberately KEPT (requirements.sglang.txt installs/reasserts
-# it): SGLang's sglang.srt.utils.video_decoder selects torchcodec as its primary
-# video-input backend, and without it the sglang video-input path is dead —
-# remove it from this purge (and keep it in sync with the SGLang pyproject the
-# base image builds from, v0.5.20 pins torchcodec==0.15.0). Its vendored LGPL
-# FFmpeg registers software H.264/H.265 decoders; that is accepted for this
-# internal image and excluded from the bundled-libavcodec scan in
-# tests/dependencies/test_no_software_video_codecs.py (see the import guard
-# this layer asserts below).
+# (PyAV, decord, OpenCV, torchcodec + any base ffmpeg/libav*), then copy the
+# VP9-only in-tree ffmpeg from wheel_builder below for the video-generation
+# encode path. H.264/H.265/AAC encoders must never appear (guarded at the end).
 #
 # Inkling image preprocessing uses Pillow. Its audio feature extractor imports
 # soundfile and uses torchaudio only for resampling, so those paths remain
@@ -224,7 +214,8 @@ RUN set -eux; \
         decord \
         decord2 \
         opencv-python \
-        opencv-python-headless; \
+        opencv-python-headless \
+        torchcodec; \
     SITE_PACKAGES="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
     rm -rf \
         "${SITE_PACKAGES}"/av \
@@ -239,6 +230,8 @@ RUN set -eux; \
         "${SITE_PACKAGES}"/decord2.libs \
         "${SITE_PACKAGES}"/opencv_python*.dist-info \
         "${SITE_PACKAGES}"/opencv_python*.libs \
+        "${SITE_PACKAGES}"/torchcodec \
+        "${SITE_PACKAGES}"/torchcodec-*.dist-info \
         /usr/local/bin/ffmpeg \
         /usr/local/bin/ffprobe \
         /usr/local/include/libav* \
@@ -252,12 +245,6 @@ RUN set -eux; \
         /usr/local/src/ffmpeg \
         /root/.cache/pip; \
     ldconfig
-
-# Positive guard: SGLang's video-input path selects torchcodec as its primary
-# decode backend (see sglang.srt.utils.video_decoder). The purge above must keep
-# it — and the requirements.sglang.txt install above must have installed it —
-# or this fails the build rather than the first video request at runtime.
-RUN python3 -c "import torchcodec; from torchcodec.decoders import VideoDecoder"
 {% endif %}
 
 # Drop the Nsight efa_metrics plugin the CUDA floor carries: a Go NIC sampler

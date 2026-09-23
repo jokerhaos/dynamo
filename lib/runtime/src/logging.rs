@@ -1269,9 +1269,7 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
                 "/v1/logs",
             );
 
-            let resource = opentelemetry_sdk::Resource::builder_empty()
-                .with_service_name(service_name.clone())
-                .build();
+            let resource = otel_resource(service_name.clone());
 
             let span_exporter = build_span_exporter(traces_protocol, &traces_endpoint)?;
 
@@ -1301,11 +1299,7 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // No export - traces generated locally only (for logging/trace IDs)
             let mut provider_builder = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_resource(
-                    opentelemetry_sdk::Resource::builder_empty()
-                        .with_service_name(service_name.clone())
-                        .build(),
-                );
+                .with_resource(otel_resource(service_name.clone()));
             if let Some(sample_ratio) = sample_ratio {
                 provider_builder = provider_builder.with_sampler(Sampler::ParentBased(Box::new(
                     Sampler::TraceIdRatioBased(sample_ratio),
@@ -1955,6 +1949,17 @@ impl tracing::field::Visit for JsonVisitor {
     }
 }
 
+fn otel_resource(service_name: String) -> opentelemetry_sdk::Resource {
+    // Keep the resolved service identity authoritative while admitting standard
+    // Kubernetes and deployment attributes supplied through the environment.
+    opentelemetry_sdk::Resource::builder_empty()
+        .with_detector(Box::new(
+            opentelemetry_sdk::resource::EnvResourceDetector::new(),
+        ))
+        .with_service_name(service_name)
+        .build()
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -1966,6 +1971,32 @@ pub mod tests {
     use std::io::{BufRead, BufReader};
     use stdio_override::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn otel_resource_includes_environment_and_preserves_service_name() {
+        temp_env::with_vars(
+            [(
+                "OTEL_RESOURCE_ATTRIBUTES",
+                Some(
+                    "k8s.pod.uid=pod-uid,k8s.node.name=node-a,deployment.environment.name=prod,service.name=ignored",
+                ),
+            )],
+            || {
+                let attrs: HashMap<_, _> = otel_resource("configured-service".to_owned())
+                    .iter()
+                    .map(|(key, value)| (key.as_str().to_owned(), value.to_string()))
+                    .collect();
+                assert_eq!(attrs["k8s.pod.uid"], "pod-uid");
+                assert_eq!(attrs["k8s.node.name"], "node-a");
+                assert_eq!(attrs["deployment.environment.name"], "prod");
+                assert_eq!(attrs["service.name"], "configured-service");
+            },
+        );
+        temp_env::with_vars([("OTEL_RESOURCE_ATTRIBUTES", None::<&str>)], || {
+            let resource = otel_resource("configured-service".to_owned());
+            assert_eq!(resource.len(), 1);
+        });
+    }
 
     #[test]
     fn unset_dyn_log_uses_configured_default() {

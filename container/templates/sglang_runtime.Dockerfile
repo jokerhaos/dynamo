@@ -245,6 +245,34 @@ RUN set -eux; \
         /usr/local/src/ffmpeg \
         /root/.cache/pip; \
     ldconfig
+
+# The SGLang runtime base ships apt-installed ffmpeg so its torchcodec
+# (SGLang's own video-input decode backend) can dlopen the system libav* at
+# import. Ubuntu's ffmpeg links GPL libx264/libx265 (trips the codec guard
+# below) AND its dependency closure drags in ~34 copyleft media peripherals
+# (libpulse, libsdl2, libjack, libzvbi, ...) that the license gate in the
+# licenses stage denies. The published Dynamo image carries no software
+# H.264/H.265/AAC codec implementation and no third-party libav*
+# (codec_policy.yaml + test_no_software_video_codecs.py): encode is the
+# in-tree VP9 ffmpeg copied above, and video-input decode runs on NVDEC via
+# PyNvVideoCodec, which bundles only libavutil + libavformat and needs no
+# system ffmpeg. Purge the base's apt media stack; the guards below assert
+# the result. Full package-name prefixes so libavahi-* never matches, while
+# digit suffixes can drift across base bumps (libavcodec60 vs 58). No
+# autoremove — a bare sweep of auto-installed packages would take the
+# toolchain and CUDA math libs with it; see the equivalent purge in
+# vllm_runtime.Dockerfile. libva/libvdpau stay behind: license-clean,
+# owned by the graphics stack, not the media stack. CUDA only, same gating
+# as the purge above: the XPU image is not published and keeps its stack.
+RUN set -eux; \
+    purge="$(dpkg-query -W -f='${Package}\n' 2>/dev/null \
+        | grep -E '^(ffmpeg|libaom|libass[0-9]|libavc1394|libavcodec|libavdevice|libavfilter|libavformat|libavutil|libbluray|libbs2b|libcaca|libcdio|libchromaprint|libcodec2|libdav1d|libdc1394|libfdk-aac|libflite|libgme|libgsm|libiec61883|libjack|libmp3lame|libopencore|libopus|libpocketsphinx|libpostproc|libpulse|libraw1394|librubberband|libsdl[0-9]|libshine|libsndfile|libsphinxbase|libsrt[0-9]|libsoxr|libsvtav1|libswresample|libswscale|libtheora|libtwolame|libudfread|libvidstab|libvorbis|libvpx|libx264|libx265|libxvidcore|libzvbi)' \
+        || true)"; \
+    if [ -n "${purge}" ]; then \
+        echo "purging apt media packages from SGLang base:" ${purge}; \
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y ${purge}; \
+    fi; \
+    ldconfig
 {% endif %}
 
 # Drop the Nsight efa_metrics plugin the CUDA floor carries: a Go NIC sampler

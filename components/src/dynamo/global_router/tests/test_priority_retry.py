@@ -3,6 +3,7 @@
 
 """Tests for priority retry forwarding in the global router handler."""
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,19 @@ class FakeContext:
 
     def is_killed(self) -> bool:
         return self.killed
+
+
+class FakeResponseSender:
+    def __init__(self):
+        self.outputs = []
+        self.closed = False
+
+    def send(self, output):
+        assert not self.closed
+        self.outputs.append(output)
+
+    def close(self):
+        self.closed = True
 
 
 async def _collect_outputs(generator) -> list[dict[str, Any]]:
@@ -175,7 +189,8 @@ async def test_prefill_retries_faster_pools_until_success(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_decode_retries_using_custom_pool_priorities(tmp_path):
+@pytest.mark.parametrize("push", [False, True])
+async def test_decode_retries_using_custom_pool_priorities(tmp_path, push):
     config = _disagg_config(
         decode_pool_priorities=[5, 0, 10],
     )
@@ -190,9 +205,17 @@ async def test_decode_retries_using_custom_pool_priorities(tmp_path):
     }
 
     context = FakeContext()
+    sender = FakeResponseSender() if push else None
     outputs = await _collect_outputs(
-        handler.handle_decode({"token_ids": [1, 2, 3]}, context=context)
+        handler.handle_decode(
+            {"token_ids": [1, 2, 3]}, context=context, response_sender=sender
+        )
     )
+
+    if sender is not None:
+        assert outputs == []
+        assert sender.closed
+        outputs = sender.outputs
 
     assert outputs == [{"pool": "decode-fast"}]
     assert slow.calls == 1
@@ -200,6 +223,68 @@ async def test_decode_retries_using_custom_pool_priorities(tmp_path):
     assert mid.calls == 0
     assert slow.contexts == [context]
     assert fast.contexts == [context]
+
+
+def test_decode_push_signature_is_visible_to_runtime():
+    assert (
+        "response_sender"
+        in inspect.signature(GlobalRouterHandler.handle_decode).parameters
+    )
+    assert inspect.isasyncgenfunction(GlobalRouterHandler.handle_decode)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_after_output", [False, True])
+async def test_decode_push_preserves_frames_and_stream_failure(
+    tmp_path, fail_after_output
+):
+    handler = _handler(_write_config(tmp_path, _disagg_config()))
+    frames = [{"token_ids": [i]} for i in range(3)]
+    slow = FakeClient(
+        "decode-slow", outputs=frames, fail_after_output=fail_after_output
+    )
+    fast = FakeClient("decode-fast", outputs=[{"token_ids": [999]}])
+    handler.decode_clients = {
+        "decode-slow": slow,
+        "decode-mid": FakeClient("decode-mid"),
+        "decode-fast": fast,
+    }
+    sender = FakeResponseSender()
+    stream = handler.handle_decode({"token_ids": [1]}, response_sender=sender)
+    if fail_after_output:
+        with pytest.raises(RuntimeError, match="stream failed after output"):
+            await _collect_outputs(stream)
+        assert sender.outputs == frames[:1]
+        assert not sender.closed
+    else:
+        assert await _collect_outputs(stream) == []
+        assert sender.outputs == frames
+        assert sender.closed
+    assert fast.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_decode_push_sender_failure_is_not_retried(tmp_path):
+    handler = _handler(_write_config(tmp_path, _disagg_config()))
+    slow = FakeClient("decode-slow", outputs=[{"token_ids": [1]}])
+    fast = FakeClient("decode-fast", outputs=[{"token_ids": [999]}])
+    handler.decode_clients = {
+        "decode-slow": slow,
+        "decode-mid": FakeClient("decode-mid"),
+        "decode-fast": fast,
+    }
+
+    class ClosedSender(FakeResponseSender):
+        def send(self, output):
+            raise RuntimeError("response consumer closed")
+
+    sender = ClosedSender()
+    with pytest.raises(RuntimeError, match="response consumer closed"):
+        await _collect_outputs(
+            handler.handle_decode({"token_ids": [1]}, response_sender=sender)
+        )
+    assert fast.calls == 0
+    assert not sender.closed
 
 
 @pytest.mark.asyncio

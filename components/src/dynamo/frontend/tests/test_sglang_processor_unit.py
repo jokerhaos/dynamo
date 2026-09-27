@@ -3427,6 +3427,64 @@ class TestIncrementalDetokenization:  # FRONTEND.6 — token-id stream → text
         assert content == "한"
         assert "\ufffd" not in content
 
+    @pytest.mark.parametrize(
+        "first_text,reasoning",
+        [("A", False), ("한", False), ("🙂", False), ("A", True)],
+    )
+    def test_first_visible_chunk_does_not_wait_for_stream_interval(
+        self, first_text, reasoning
+    ):
+        """Finish the first character immediately, then resume normal batching."""
+        first_ids = list(
+            (("<think>" if reasoning else "") + first_text).encode("utf-8")
+        )
+        token_ids = first_ids + list(b"x" * 21)
+        engine = FakeRoutedEngine(
+            items=[{"token_ids": [token_id]} for token_id in token_ids]
+            + [{"token_ids": [], "finish_reason": "stop"}]
+        )
+        processor = SglangProcessor(
+            tokenizer=self.ByteTokenizer(),
+            routed_engine=engine,
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_ids=None,
+            stream_interval=20,
+        )
+        _, reasoning_parser = create_parsers(
+            {},
+            tool_call_parser_name=None,
+            reasoning_parser_name="glm45" if reasoning else None,
+        )
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=reasoning_parser,
+        )
+
+        async def collect():
+            return [
+                (engine.yielded, item["data"]["choices"][0])
+                async for item in processor._generate_and_stream(
+                    "req-first-visible", {"model": "test-model"}, {}, [], post
+                )
+                if "data" in item
+            ]
+
+        chunks = asyncio.run(collect())
+        field = "reasoning_content" if reasoning else "content"
+        assert chunks[0][0] == len(first_ids)
+        assert chunks[0][1]["delta"] == {
+            "role": "assistant",
+            field: first_text,
+        }
+        assert chunks[1][0] == len(first_ids) + 20
+        assert chunks[1][1]["delta"][field] == "x" * 20
+        assert chunks[-1][1]["finish_reason"] == "stop"
+        assert "".join(c["delta"].get(field, "") for _, c in chunks) == (
+            first_text + "x" * 21
+        )
+
     def test_logprobs_reconstruct_split_multibyte_character(self):
         """Logprob token strings use context to reconstruct split UTF-8."""
         post = SglangStreamingPostProcessor(

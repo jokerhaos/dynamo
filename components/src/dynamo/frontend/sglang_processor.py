@@ -890,6 +890,10 @@ class SglangProcessor:
                         dynamo_out["nvext"] = response_nvext
 
                     envelope["data"] = dynamo_out
+                    # A special token, incomplete UTF-8 sequence, or parser
+                    # prefix may consume tokens without producing a choice.
+                    # Keep flushing immediately until the first visible output.
+                    first_chunk = False
 
                 metrics: dict[str, Any] = {
                     "input_tokens": input_tokens,
@@ -913,7 +917,6 @@ class SglangProcessor:
                 pending_log_probs = None
                 pending_top_logprobs = None
                 pending_usage = None
-                first_chunk = False
                 return envelope
 
             async for dynamo_response in dynamo_stream:

@@ -276,7 +276,7 @@ class GlobalRouterHandler:
             yield data
 
     async def handle_decode(
-        self, request: Dict[str, Any], context=None
+        self, request: Dict[str, Any], context=None, response_sender=None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Handle decode requests from the frontend (disagg mode).
@@ -332,7 +332,17 @@ class GlobalRouterHandler:
             pool_priorities=self.config.decode_pool_priorities,
             context=context,
         ):
-            yield data
+            if response_sender is None:
+                # In-process and health-check callers still consume a generator.
+                yield data
+            else:
+                # Opt into the runtime's bounded push egress. Pulling this
+                # forwarding generator from Rust costs a cross-thread Python
+                # future and additional GIL acquisitions for every token frame.
+                response_sender.send(data)
+        if response_sender is not None:
+            # Only close on success; let the runtime preserve typed errors.
+            response_sender.close()
 
     async def handle_generate(
         self, request: Dict[str, Any], context=None

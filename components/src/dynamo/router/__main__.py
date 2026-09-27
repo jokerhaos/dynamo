@@ -80,7 +80,7 @@ class StandaloneRouterHandler:
             logger.error(f"Failed to initialize KvRouter: {e}")
             raise
 
-    async def generate(self, request, context=None):
+    async def generate(self, request, context=None, response_sender=None):
         """
         Generate tokens using the KV-aware router.
 
@@ -139,7 +139,15 @@ class StandaloneRouterHandler:
                 "engine_data": worker_output.get("engine_data"),  # type: ignore[attr-defined]
                 "routing_data": worker_output.get("routing_data"),  # type: ignore[attr-defined]
             }
-            yield llm_engine_output
+            if response_sender is None:
+                yield llm_engine_output
+            else:
+                response_sender.send(llm_engine_output)
+
+        # Close only on success: the runtime must propagate failures, including
+        # failures after partial output, through the still-open response channel.
+        if response_sender is not None:
+            response_sender.close()
 
     async def best_worker_id(
         self, token_ids, router_config_override=None, cache_namespace=None

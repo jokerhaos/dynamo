@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import json
 
 import pytest
 
@@ -150,3 +151,57 @@ async def test_python_request_plane_plain_annotated_error_and_malformed_frames(
         with pytest.raises(ValueError, match=message):
             async for _ in stream:
                 pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("request_plane", ["tcp"], indirect=True)
+@pytest.mark.parametrize("push", [False, True])
+@pytest.mark.parametrize("category", ["ResourceExhausted", "Unavailable"])
+async def test_python_forwarder_preserves_structured_stream_errors(
+    runtime, push, category
+):
+    original = {
+        "error_type": category,
+        "message": "forwarded test failure",
+        "caused_by": {"error_type": "Unknown", "message": "test cause"},
+    }
+
+    async def upstream(_request, context):
+        yield {"sequence": 1}
+        yield {"_dynamo_annotated": True, "event": "error", "error": original}
+
+    upstream_endpoint = runtime.endpoint("forwarded-error.upstream.generate")
+    upstream_task = asyncio.ensure_future(upstream_endpoint.serve_endpoint(upstream))
+    forward_task = None
+    try:
+        upstream_client = await upstream_endpoint.client()
+        await upstream_client.wait_for_instances()
+
+        async def pull_forward(request, context):
+            async for response in await upstream_client.generate(request):
+                yield response.data()
+
+        async def push_forward(request, context, response_sender=None):
+            async for response in await upstream_client.generate(request):
+                response_sender.send(response.data())
+            response_sender.close()
+
+        forward_endpoint = runtime.endpoint("forwarded-error.router.generate")
+        forward_task = asyncio.ensure_future(
+            forward_endpoint.serve_endpoint(push_forward if push else pull_forward)
+        )
+        client = await forward_endpoint.client()
+        await client.wait_for_instances()
+        received = []
+        with pytest.raises(ValueError) as raised:
+            async for response in await client.generate({}):
+                received.append(response.data())
+        assert received == [{"sequence": 1}]
+        assert json.loads(raised.value._dynamo_error) == original
+    finally:
+        for task in [forward_task, upstream_task]:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task

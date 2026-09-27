@@ -11,7 +11,10 @@
 //! corresponding entry to the macro invocation below to keep Python exceptions
 //! in sync.
 
-use dynamo_runtime::error::BackendError;
+mod forwarded;
+pub use forwarded::{ForwardedDynamoError, dynamo_error_to_pyerr, restore_forwarded_error};
+
+use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
@@ -33,6 +36,27 @@ pub fn queue_rejection_to_pyerr(rejection: dynamo_kv_router::scheduling::QueueRe
         return error;
     }
     error
+}
+
+/// Preserve admission failures before a response stream has been created.
+pub fn routing_error_to_pyerr(error: anyhow::Error) -> PyErr {
+    if let Some(rejection) = error.downcast_ref::<dynamo_kv_router::scheduling::QueueRejection>() {
+        return queue_rejection_to_pyerr(rejection.clone());
+    }
+    dynamo_error_to_pyerr(DynamoError::from(error.as_ref()))
+}
+
+/// A queue policy rejection is capacity exhaustion, not malformed user input.
+pub fn restore_routing_error(py: Python<'_>, error: &PyErr) -> Option<DynamoError> {
+    if error.is_instance_of::<RouterQueueLimitExceeded>(py) {
+        return Some(
+            DynamoError::builder()
+                .error_type(ErrorType::ResourceExhausted)
+                .message(error.value(py).str().ok()?.to_string_lossy().into_owned())
+                .build(),
+        );
+    }
+    restore_forwarded_error(py, error)
 }
 
 // Raised by the in-process `SelectionService` bindings for selector failures
@@ -96,6 +120,7 @@ macro_rules! define_dynamo_exceptions {
         /// Register all Dynamo exception classes on the `_core` module.
         pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
             m.add("DynamoException", m.py().get_type::<DynamoException>())?;
+            m.add("ForwardedDynamoError", m.py().get_type::<ForwardedDynamoError>())?;
             m.add(
                 "RouterQueueLimitExceeded",
                 m.py().get_type::<RouterQueueLimitExceeded>(),
@@ -157,4 +182,60 @@ pub fn extract_http_like_error(py: Python<'_>, err: &PyErr) -> Option<(u16, Stri
         })?;
     let message = value.getattr("message").ok()?.extract::<String>().ok()?;
     Some((code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_kv_router::scheduling::{QueueLimitKind, QueueRejection};
+
+    #[test]
+    fn queue_rejection_remains_capacity_exhaustion_across_python() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let rejection = QueueRejection {
+                policy_class: "default".into(),
+                limit_kind: QueueLimitKind::UncachedTokens,
+                current: 13,
+                limit: 12,
+            };
+            let expected = rejection.to_string();
+            let exception =
+                routing_error_to_pyerr(anyhow::Error::new(rejection).context("routing failed"));
+            assert!(exception.is_instance_of::<RouterQueueLimitExceeded>(py));
+            assert_eq!(
+                exception
+                    .value(py)
+                    .getattr("limit")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                12
+            );
+            let restored = restore_routing_error(py, &exception).unwrap();
+            assert_eq!(restored.error_type(), ErrorType::ResourceExhausted);
+            assert_eq!(restored.message(), expected);
+        });
+    }
+
+    #[test]
+    fn admission_failure_preserves_typed_cause_and_plain_errors_stay_plain() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let original = DynamoError::builder()
+                .error_type(ErrorType::Unavailable)
+                .message("no available workers")
+                .build();
+            let exception = routing_error_to_pyerr(anyhow::Error::new(original));
+            let restored = restore_routing_error(py, &exception).unwrap();
+            assert_eq!(restored.error_type(), ErrorType::Unavailable);
+            assert!(
+                restore_routing_error(
+                    py,
+                    &pyo3::exceptions::PyValueError::new_err("invalid input")
+                )
+                .is_none()
+            );
+        });
+    }
 }

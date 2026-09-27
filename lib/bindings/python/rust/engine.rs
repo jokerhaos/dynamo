@@ -382,6 +382,10 @@ pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
     Python::with_gil(|py| {
         error.display(py);
 
+        if let Some(original) = crate::errors::restore_routing_error(py, &error) {
+            return original;
+        }
+
         if let Some((backend_err, message)) = py_exception_to_backend_error(py, &error) {
             return DynamoError::builder()
                 .error_type(ErrorType::Backend(backend_err))
@@ -742,5 +746,33 @@ impl AsyncEngine<ManyIn<PythonPayload>, ManyOut<PythonResponseItem>, Error>
 
         let response_stream = unbuffered_python_response_stream(stream, ctx.clone(), request_id);
         Ok(ResponseStream::new(response_stream, ctx))
+    }
+}
+
+#[cfg(test)]
+mod forwarded_error_tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_categories_survive_while_python_validation_stays_invalid() {
+        pyo3::prepare_freethreaded_python();
+        for category in [
+            ErrorType::ResourceExhausted,
+            ErrorType::Unavailable,
+            ErrorType::Cancelled,
+        ] {
+            let error = DynamoError::builder()
+                .error_type(category)
+                .message("forwarded failure")
+                .build();
+            let mapped = map_python_exception(crate::errors::dynamo_error_to_pyerr(error));
+            assert_eq!(mapped.error_type(), category);
+            assert_eq!(mapped.message(), "forwarded failure");
+        }
+        let mapped = map_python_exception(pyo3::exceptions::PyValueError::new_err("invalid input"));
+        assert_eq!(
+            mapped.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        );
     }
 }

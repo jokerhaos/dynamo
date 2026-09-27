@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import importlib.util
 import sys
 import types
@@ -221,3 +222,120 @@ async def test_generate_applies_model_fallback_when_missing() -> None:
     assert forwarded["model"] == "unknown"
     assert forwarded["routing"] is None
     assert forwarded["token_ids"] == [9]
+
+
+class RecordingSender:
+    def __init__(self):
+        self.outputs = []
+        self.closed = False
+        self.first_sent = asyncio.Event()
+
+    def send(self, output):
+        assert not self.closed
+        self.outputs.append(output)
+        self.first_sent.set()
+
+    def close(self):
+        assert not self.closed
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_push_matches_pull_and_preserves_context_and_metadata():
+    handler, router = handler_with_router()
+    context = object()
+    request = {"model": "test-model", "token_ids": [1], "require_reasoning": True}
+    frames = [
+        {"token_ids": [2], "extra_args": {"kv_transfer_params": {"key": "value"}}},
+        {
+            "token_ids": [3],
+            "finish_reason": "stop",
+            "completion_usage": {"completion_tokens": 2},
+            "routing_data": {"worker_id": 7, "timing": {"prefill_ms": 12}},
+            "engine_data": {"prompt_logprobs": [0.5]},
+        },
+    ]
+
+    async def responses():
+        for frame in frames:
+            yield frame
+
+    router.generate_from_request.return_value = responses()
+    pulled = [output async for output in handler.generate(request, context=context)]
+    router.generate_from_request.reset_mock()
+    router.generate_from_request.return_value = responses()
+    sender = RecordingSender()
+    yielded = [
+        output
+        async for output in handler.generate(
+            request, context=context, response_sender=sender
+        )
+    ]
+    assert yielded == []
+    assert sender.outputs == pulled
+    assert sender.closed
+    router.generate_from_request.assert_awaited_once_with(
+        {**request, "routing": None}, context=context
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_first_frame", [False, True])
+async def test_push_propagates_failure_without_closing_sender(after_first_frame):
+    handler, router = handler_with_router()
+    failure = ValueError("worker rejected request")
+
+    async def responses():
+        yield {"token_ids": [2]}
+        raise failure
+
+    if after_first_frame:
+        router.generate_from_request.return_value = responses()
+    else:
+        router.generate_from_request.side_effect = failure
+    sender = RecordingSender()
+    with pytest.raises(ValueError) as raised:
+        _ = [
+            output
+            async for output in handler.generate(
+                {"token_ids": [1]}, response_sender=sender
+            )
+        ]
+    assert raised.value is failure
+    assert len(sender.outputs) == int(after_first_frame)
+    assert not sender.closed
+
+
+@pytest.mark.asyncio
+async def test_push_forwards_first_frame_without_waiting_for_completion():
+    handler, router = handler_with_router()
+    release = asyncio.Event()
+    sender = RecordingSender()
+
+    async def responses():
+        yield {"token_ids": [2]}
+        await release.wait()
+        yield {"token_ids": [], "finish_reason": "stop"}
+
+    router.generate_from_request.return_value = responses()
+
+    async def consume():
+        return [
+            output
+            async for output in handler.generate(
+                {"token_ids": [1]}, response_sender=sender
+            )
+        ]
+
+    task = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(sender.first_sent.wait(), timeout=2)
+        assert not task.done()
+        assert sender.outputs[0]["token_ids"] == [2]
+        assert not sender.closed
+        release.set()
+        assert await asyncio.wait_for(task, timeout=2) == []
+        assert sender.closed
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

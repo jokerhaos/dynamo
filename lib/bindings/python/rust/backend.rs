@@ -1715,6 +1715,9 @@ where
 /// subclasses go through the shared mapping table; built-in Python
 /// exceptions fall back to the closest category.
 fn py_err_to_dynamo(err: PyErr) -> DynamoError {
+    if let Some(original) = Python::with_gil(|py| crate::errors::restore_routing_error(py, &err)) {
+        return original;
+    }
     let (backend, message) = Python::with_gil(|py| {
         if let Some(mapped) = py_exception_to_backend_error(py, &err) {
             return mapped;
@@ -1756,4 +1759,32 @@ fn py_err_to_dynamo(err: PyErr) -> DynamoError {
         .error_type(ErrorType::Backend(backend))
         .message(message)
         .build()
+}
+
+#[cfg(test)]
+mod forwarded_error_tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_categories_survive_while_python_validation_stays_invalid() {
+        pyo3::prepare_freethreaded_python();
+        for category in [
+            ErrorType::ResourceExhausted,
+            ErrorType::Unavailable,
+            ErrorType::Cancelled,
+        ] {
+            let error = DynamoError::builder()
+                .error_type(category)
+                .message("forwarded failure")
+                .build();
+            let mapped = py_err_to_dynamo(crate::errors::dynamo_error_to_pyerr(error));
+            assert_eq!(mapped.error_type(), category);
+            assert_eq!(mapped.message(), "forwarded failure");
+        }
+        let mapped = py_err_to_dynamo(pyo3::exceptions::PyValueError::new_err("invalid input"));
+        assert_eq!(
+            mapped.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        );
+    }
 }

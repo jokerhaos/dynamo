@@ -15,6 +15,17 @@ FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS pre_runtime
 
 ARG MODELEXPRESS_VERSION
 
+{% if device == "cuda" and cuda_version == "13.0" %}
+# Reuse the already-built SGLang source revision containing AIV-883/885,
+# while replacing its older Mooncake wheel with the native tracing release.
+ARG MOONCAKE_CUDA13_VERSION=0.3.13.post2
+ARG MOONCAKE_FIND_LINKS=https://minio.0xtoken.cn/python-packages/simple/mooncake-transfer-engine-cuda13/index.html
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --break-system-packages --no-deps --no-index \
+        --find-links "${MOONCAKE_FIND_LINKS}" \
+        "mooncake-transfer-engine-cuda13==${MOONCAKE_CUDA13_VERSION}"
+{% endif %}
+
 WORKDIR /workspace
 
 # Install NATS and ETCD
@@ -421,6 +432,11 @@ RUN set -eux; \
 # every Frontend and worker after deployment.
 {% if target not in ("dev", "local-dev") %}
 RUN python3 -c "import dynamo.frontend.sglang_processor; import dynamo.sglang.args; import sglang"
+{% if device == "cuda" and cuda_version == "13.0" %}
+# Verify the inherited wheel still loads after runtime dependency cleanup.
+RUN --mount=type=bind,source=container/deps/check_mooncake_native_tracing.py,target=/tmp/check_mooncake_native_tracing.py \
+    python3 /tmp/check_mooncake_native_tracing.py
+{% endif %}
 {% endif %}
 {% endif %}
 

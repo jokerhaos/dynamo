@@ -38,12 +38,17 @@ repos:
   - id: clang-format
     types_or: [c, c++, cuda, proto, textproto, java]
     args: ["-fallback-style=none", "-style=file", "-i"]
-- repo: https://github.com/codespell-project/codespell
-  rev: v2.2.4
+- repo: local
   hooks:
   - id: codespell
-    # Use pyproject.toml for codespell configuration
-    additional_dependencies: [tomli]
+    name: codespell
+    entry: codespell
+    language: python
+    types: [text]
+    # Keep the upstream v2.2.4 hook behavior, but install from the Python
+    # mirror instead of cloning a Git repository through the download proxy.
+    # tomli enables the existing pyproject.toml configuration.
+    additional_dependencies: [codespell==2.2.4, tomli]
 
 # More details about these pre-commit hooks here:
 # https://pre-commit.com/hooks.html

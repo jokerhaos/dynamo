@@ -218,7 +218,7 @@ jobs:
         # Bypass pre-commit/action: its bundled actions/cache round-trips
         # the 78MB hook-env archive through the painfully slow GitHub cache
         # service (~0.4MB/s here) and, on restore timeouts, falls into a
-        # cold re-init. Keep hook environments on the persistent /cache
+        # cold re-init. Keep hook environments on the persistent /cache/repos
         # volume instead — restored from local disk in seconds and shared
         # across runs. First run seeds it via gh-proxy clones (else-branch
         # keeps the ephemeral-pod default when /cache is absent).
@@ -226,15 +226,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
-            # /cache itself is root-owned; /cache/repos is the pre-made
-            # writable subvolume. Provision /cache/pre-commit once via the
-            # runner's passwordless sudo (same trust level as the apt step).
-            if [ ! -d /cache/pre-commit ] || [ ! -w /cache/pre-commit ]; then
-              sudo mkdir -p /cache/pre-commit
-              sudo chown "$(id -u):$(id -g)" /cache/pre-commit
-            fi
-            export PRE_COMMIT_HOME=/cache/pre-commit
-            echo "PRE_COMMIT_HOME=/cache/pre-commit (persistent volume)"
+            # Only /cache/repos is mounted from the persistent PVC.
+            export PRE_COMMIT_HOME=/cache/repos/.pre-commit
+            mkdir -p "$PRE_COMMIT_HOME"
+            echo "PRE_COMMIT_HOME=$PRE_COMMIT_HOME (persistent volume)"
           fi
           "$HOME/venv/bin/pre-commit" run --show-diff-on-failure --color=always --all-files
 

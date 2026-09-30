@@ -155,6 +155,18 @@ sglang:
   # build doesn't leak into the runtime image.
   nixl_ref: v1.4.0
   enable_media_ffmpeg: "false"
+  # Internal-only (astro-web3 fork): keep the SGLang base's full Ubuntu apt media
+  # stack in the cuda13 build — full-featured /usr/bin/ffmpeg (libx264 + AAC
+  # encoders) + /usr/bin/ffprobe — instead of purging to the VP9-only in-tree
+  # build. MiniMax-H3's output encode path (sglang multimodal_gen entrypoints)
+  # hard-codes libx264 + AAC and its _resolve_ffmpeg_exe() prefers
+  # IMAGEIO_FFMPEG_EXE, so the H3 video+audio serving path needs a full-codec
+  # ffmpeg. Strict posture (purge + VP9-only in-tree copy + codec guards) is
+  # preserved for every other render: vllm/trtllm frameworks, sglang XPU, and
+  # any build that flips this off. License waivers for the apt media closure
+  # live in compliance/policy/licenses.toml; the codec scan for this variant
+  # runs against compliance/policy/codec_policy_full_media.yaml.
+  enable_full_media_stack: "true"
   enable_gpu_memory_service: "true"
   enable_kvbm: "false"
   enable_modelexpress: "true"

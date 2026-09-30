@@ -7,6 +7,18 @@
 ########## Runtime Image #########
 ##################################
 
+{# Internal full-media variant (astro-web3 fork). When
+   context.sglang.enable_full_media_stack == "true" this template keeps the
+   SGLang base's Ubuntu apt media stack (full-featured /usr/bin/ffmpeg +
+   /usr/bin/ffprobe) instead of purging to the VP9-only in-tree build:
+   MiniMax-H3's output encode (sglang multimodal_gen entrypoints) hard-codes
+   libx264 + AAC, its reference-material decode runs through the ffmpeg CLI,
+   and ffprobe must be on PATH. Every other render — including this file's
+   own xpu device branch and the vllm/trtllm frameworks — keeps the strict
+   upstream posture unchanged (this flag is only set in the sglang section
+   of container/context.yaml). #}
+{% set full_media = framework == "sglang" and device == "cuda" and context.sglang.get("enable_full_media_stack", "false") == "true" %}
+
 {% if device == "xpu" %}
 FROM framework AS runtime
 {% else %}
@@ -154,6 +166,21 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     export PIP_CACHE_DIR=/root/.cache/pip && \
     pip install --break-system-packages --no-deps "distro==1.9.0"
 
+{% if device == "cuda" and cuda_version == "13.0" %}
+# Install the s3 backend for dynamo.common.storage.get_fs (--media-output-fs-url
+# s3://; for us the OSS S3-compatibility entrance). s3fs pins fsspec ==2026.6.0,
+# exactly the version this image ships. aiobotocore==3.9.1 pins botocore==1.43.75,
+# which replaces the newer botocore inherited from the SGLang base -- the pairing
+# field-validated 2026-09-30 against OSS on b300-1 (virtual-host addressing and
+# checksum config still come from the FSSPEC_S3_* env vars, documented in the
+# deployment DGD). Installed WITH deps so the aioitertools closure ships; nothing
+# on the serving paths imports boto3 directly. Replaces the pip half of the
+# media-deps initContainer in the minimaxh3 DGD.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    export PIP_CACHE_DIR=/root/.cache/pip && \
+    pip install --break-system-packages "s3fs==2026.6.0" "aiobotocore==3.9.1"
+{% endif %}
+
 # Install gpu_memory_service wheel if enabled (all targets)
 ARG ENABLE_GPU_MEMORY_SERVICE
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
@@ -257,6 +284,7 @@ RUN set -eux; \
         /root/.cache/pip; \
     ldconfig
 
+{% if device == "cuda" and not full_media %}
 # The SGLang runtime base ships apt-installed ffmpeg so its torchcodec
 # (SGLang's own video-input decode backend) can dlopen the system libav* at
 # import. Ubuntu's ffmpeg links GPL libx264/libx265 (trips the codec guard
@@ -284,6 +312,22 @@ RUN set -eux; \
         DEBIAN_FRONTEND=noninteractive apt-get purge -y ${purge}; \
     fi; \
     ldconfig
+{% elif full_media %}
+# Full-media variant: the apt media purge above is deliberately SKIPPED.
+# This image ships the SGLang base's Ubuntu ffmpeg (libx264 + AAC encoders,
+# full decoder set, /usr/bin/ffprobe) as its media backend — that is the
+# variant's whole point. The per-package license waivers live in
+# licenses.toml and the codec scan runs against
+# policy/codec_policy_full_media.yaml; the strict guards below (in-tree
+# VP9 copy, codec-encoders check, find-scan) are also skipped. The wheel-level
+# purge above still runs: PyAV/decord/opencv/torchcodec stay out, and any
+# /usr/local ffmpeg the base carries is removed so /usr/bin/ffmpeg is the
+# single CLI on PATH.
+RUN set -eux; \
+    ffmpeg_bin="$(command -v ffmpeg)"; \
+    case "${ffmpeg_bin}" in /usr/bin/ffmpeg) ;; *) echo "full-media variant expects apt ffmpeg at /usr/bin/ffmpeg, found: ${ffmpeg_bin:-none}" >&2; exit 1;; esac; \
+    test -x /usr/bin/ffprobe
+{% endif %}
 {% endif %}
 
 # Drop the Nsight efa_metrics plugin the CUDA floor carries: a Go NIC sampler
@@ -298,7 +342,7 @@ RUN rm -rf \
         /opt/nvidia/nsight-compute/*/host/target-linux-*/plugins/efa_metrics && \
     [ -z "$(find /usr/local /opt -xdev -type d -name efa_metrics 2>/dev/null)" ]
 
-{% if device == "cuda" %}
+{% if device == "cuda" and not full_media %}
 # Copy the in-tree VP9 ffmpeg from wheel_builder: versioned shared libs
 # (libav*.so*, libsw*.so*) + libvpx + the in-tree CLI binary that imageio targets
 # via IMAGEIO_FFMPEG_EXE. The upstream ffmpeg was purged above, so this
@@ -329,6 +373,31 @@ RUN set -eu; \
         echo "ERROR: shipped ffmpeg ($ff) exposes an H.264/H.265/AAC/NVENC encoder" >&2; \
         exit 1; \
     fi
+{% elif full_media %}
+# Full-media variant: no in-tree VP9 copy. imageio and SGLang's
+# _resolve_ffmpeg_exe() (which prefers IMAGEIO_FFMPEG_EXE over PATH) must land
+# on the apt ffmpeg — pinning the env explicitly also fails loudly if the base
+# ever stops shipping it at /usr/bin/ffmpeg.
+ENV IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg
+# Marks the shipped image for tests/dependencies/test_no_software_video_codecs.py,
+# which asserts the strict no-software-codec posture and is skipped for this
+# variant (see its module docstring).
+ENV DYNAMO_FULL_MEDIA_STACK=1
+
+# Positive capability guard: the strict variant above asserts the ABSENCE of
+# H.264/AAC; this variant asserts their PRESENCE. MiniMax-H3's output encoder
+# hard-codes libx264 + aac and its pipeline __init__ requires ffprobe on PATH,
+# so a base bump that ships a crippled ffmpeg fails HERE, not at the first
+# /v1/videos request. libvpx_vp9 is asserted too — dynamo's own t2v encode
+# path encodes VP9 with this binary.
+RUN set -eu; \
+    ff="${IMAGEIO_FFMPEG_EXE}"; \
+    test -x "${ff}" || { echo "ERROR: ${ff} missing" >&2; exit 1; }; \
+    test -x /usr/bin/ffprobe || { echo "ERROR: /usr/bin/ffprobe missing" >&2; exit 1; }; \
+    enc="$("${ff}" -hide_banner -encoders 2>/dev/null)"; \
+    echo "${enc}" | grep -qw libx264 || { echo "ERROR: apt ffmpeg has no libx264 encoder" >&2; exit 1; }; \
+    echo "${enc}" | grep -qw aac || { echo "ERROR: apt ffmpeg has no aac encoder" >&2; exit 1; }; \
+    echo "${enc}" | grep -qiE 'libvpx[-_]vp9' || { echo "ERROR: apt ffmpeg has no libvpx_vp9 encoder" >&2; exit 1; }
 {% else %}
 ENV IMAGEIO_FFMPEG_EXE=
 {% endif %}
@@ -412,7 +481,7 @@ RUN SITE_PACKAGES="$(python3 -c 'import site; print(site.getsitepackages()[0])')
 # build on the base image's own libraries -- which is precisely what happened to
 # the first version of this change, where gating the purge alone turned a working
 # XPU build into a failing one.
-{% if device == "cuda" %}
+{% if device == "cuda" and not full_media %}
 RUN set -eux; \
     remaining="$(find /usr /opt /workspace /sgl-workspace -xdev \
         \( -type f -o -type l \) \
@@ -426,10 +495,19 @@ RUN set -eux; \
         exit 1; \
     fi; \
     python3 -c 'import soundfile, torchaudio; from PIL import Image'
+{% elif full_media %}
+# Full-media variant: the strict find-scan above is skipped (libx264 ships by
+# design via apt); the media-codec scan in the licenses stage runs against
+# policy/codec_policy_full_media.yaml, which re-permits exactly the apt media
+# paths while still failing on codec libraries from anywhere else (e.g. a
+# wheel-bundled libav*).
+RUN python3 -c 'import soundfile, torchaudio; from PIL import Image'
+{% endif %}
 
 # Keep the published runtime honest: Dynamo's SGLang entry points import these
 # modules before serving traffic, so fail the image build instead of crashing
 # every Frontend and worker after deployment.
+{% if device == "cuda" %}
 {% if target not in ("dev", "local-dev") %}
 RUN python3 -c "import dynamo.frontend.sglang_processor; import dynamo.sglang.args; import sglang"
 {% if device == "cuda" and cuda_version == "13.0" %}

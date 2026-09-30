@@ -1,0 +1,168 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Media-codec gate for the INTERNAL full-media SGLang variant
+# (context.yaml: sglang.enable_full_media_stack == "true"; astro-web3 fork).
+# Consumed by container/compliance/scan_codecs.py, selected by
+# templates/compliance.Dockerfile when that flag is set.
+#
+# Relationship to codec_policy.yaml (the strict policy):
+#   - deny_globs are IDENTICAL. A codec library arriving any other way —
+#     vendored into a Python wheel under site-packages, dropped into /opt,
+#     an imageio-bundled ffmpeg binary — still fails this build. Only the
+#     apt media stack installed by the SGLang base image itself is waived.
+#   - allow_paths are IDENTICAL (the in-tree VP9 ffmpeg is not copied in
+#     this variant, so they simply never match).
+#   - deny_components is intentionally ABSENT: the variant ships Ubuntu's
+#     distro-managed ffmpeg, whose security floor is Ubuntu's to maintain,
+#     not the upstream in-tree CVE-tracking scheme. The strict policy's
+#     ffmpeg>=8.1.2 gate does not key on Noble's 6.1.1 and must not fail it.
+#   - exceptions carry the strict file's DECL/dALI + PyNvVideoCodec entries
+#     and add the reasoned apt-stack waivers for this variant.
+#
+# The waivers below exist because MiniMax-H3's serving path (sglang
+# multimodal_gen) hard-codes libx264 + AAC for output encoding, decodes
+# reference material through the ffmpeg CLI, and requires ffprobe on PATH.
+# This image is published ONLY to the internal registry and deployments of
+# this fork — it is not the upstream-published artifact.
+
+# Filesystem globs (matched against absolute paths under the scan root) for
+# media-codec libraries / binaries that must not ship. libav*/libsw* are matched
+# wholesale and re-permitted only for our in-tree copy via allow_paths, so any
+# THIRD-PARTY bundled libavcodec (distro, a vendored wheel) is caught.
+deny_globs:
+  # Both the plain soname and the auditwheel hash-renamed variant (e.g. a wheel
+  # that vendors libx264-<hash>.so under its .libs/) must be caught.
+  - "**/libx264.so*"
+  - "**/libx264-*.so*"
+  - "**/libx265.so*"
+  - "**/libx265-*.so*"
+  - "**/libfdk-aac.so*"
+  - "**/libfdk-aac-*.so*"
+  - "**/libavcodec.so*"
+  - "**/libavcodec-*.so*"
+  - "**/libavdevice.so*"
+  - "**/libavdevice-*.so*"
+  - "**/libavformat.so*"
+  - "**/libavformat-*.so*"
+  - "**/libavfilter.so*"
+  - "**/libavfilter-*.so*"
+  - "**/libavutil.so*"
+  - "**/libavutil-*.so*"
+  - "**/libswscale.so*"
+  - "**/libswscale-*.so*"
+  - "**/libswresample.so*"
+  - "**/libswresample-*.so*"
+  - "**/libpostproc.so*"
+  - "**/libpostproc-*.so*"
+  # Standalone ffmpeg/ffprobe CLIs (e.g. a distro /usr/bin/ffmpeg -- waived for
+  # this variant in the exceptions below). Our own copy at /usr/local/bin/ffmpeg
+  # is re-permitted by allow_paths below.
+  - "**/bin/ffmpeg"
+  - "**/bin/ffprobe"
+  # GPL prebuilt ffmpeg binary that imageio-ffmpeg bundles under site-packages.
+  - "**/imageio_ffmpeg/binaries/ffmpeg-*"
+
+# Absolute-path prefixes whose media libraries are OUR in-tree ffmpeg, built with
+# the narrow decoder/encoder allowlist in wheel_builder.Dockerfile. Matches here
+# are reported as ALLOWED and never fail the build. (The full-media variant
+# copies nothing in at /usr/local, so these simply never match there.)
+allow_paths:
+  - "/usr/local/lib/libav"
+  - "/usr/local/lib/libsw"
+  - "/usr/local/lib/libpostproc"
+  - "/usr/local/bin/ffmpeg"
+  - "/usr/local/src/ffmpeg"   # retained source tree (kept for legal reasons)
+
+# Explicit third-party exceptions: LOGGED in the report but do NOT fail the build.
+# Every entry must carry a reason and an owner so the waiver is auditable.
+exceptions:
+  # --- Full-media variant: the SGLang base image's apt media stack -----------
+  # Ubuntu noble's ffmpeg 7:6.1.1 closure as installed by the SGLang base image.
+  # The multiarch triplet component (`/usr/lib/<triplet>/`) is left as `*` so
+  # amd64 and arm64 renders both match. These ARE the artifact's media backend
+  # (encode + reference decode + ffprobe probing); they are waived only in this
+  # policy file, which no strict render ever consults.
+  - glob: "/usr/bin/ffmpeg"
+    reason: >-
+      Deliberately-shipped media backend for the internal full-media SGLang
+      image: MiniMax-H3 output encode requires libx264/AAC and dynamo's own
+      t2v path requires libvpx_vp9, all present in Ubuntu's ffmpeg build.
+      Waiver scope: this policy file is only used when
+      sglang.enable_full_media_stack is set, never for strict renders.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/bin/ffprobe"
+    reason: >-
+      Companion probe CLI of the waived /usr/bin/ffmpeg; SGLang's H3 pipeline
+      fail-fasts on its absence and validates every final output with it.
+      Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libav*.so*"
+    reason: >-
+      apt libav* shared libraries of Ubuntu's ffmpeg (libavcodec/libavdevice/
+      libavfilter/libavformat/libavutil), dlopened by the waived
+      /usr/bin/ffmpeg. Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libsw*.so*"
+    reason: >-
+      apt libswscale/libswresample of Ubuntu's ffmpeg, companions of the
+      waived libav* set. Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libpostproc*.so*"
+    reason: >-
+      apt libpostproc of Ubuntu's ffmpeg, companion of the waived libav* set.
+      Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libx264.so*"
+    reason: >-
+      Ubuntu's libx264, the software H.264 encoder this variant ships for
+      MiniMax-H3's hard-coded output codec. GPL-2.0-or-later; per-package
+      license waiver recorded in licenses.toml. Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libx264-*.so*"
+    reason: >-
+      Auditwheel-renamed libx264 variant of the /usr/lib/*/libx264.so* waiver.
+      Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libx265.so*"
+    reason: >-
+      Ubuntu's libx265, linked by Ubuntu's ffmpeg build. Per-package license
+      waiver recorded in licenses.toml. Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libx265-*.so*"
+    reason: >-
+      Auditwheel-renamed libx265 variant of the /usr/lib/*/libx265.so* waiver.
+      Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libfdk-aac.so*"
+    reason: >-
+      FDK-AAC, if the base's ffmpeg links it. Pre-emptive companion of the
+      ffmpeg closure waiver. Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+  - glob: "/usr/lib/*/libfdk-aac-*.so*"
+    reason: >-
+      Auditwheel-renamed libfdk-aac variant of the /usr/lib/*/libfdk-aac.so*
+      waiver. Full-media variant only.
+    owner: astro-web3/dynamo maintainers
+
+  # --- Carried over verbatim from the strict policy ---------------------------
+  # (unchanged owners/reasons there; these are not full-media waivers)
+  - glob: "**/nvidia/dali/.libs/*"
+    reason: >-
+      NVIDIA DALI (nvidia-dali-cuda130) vendors its own ffmpeg stack (libav* plus
+      the libsw*/libpostproc companions) under .libs/ for its video reader. It is
+      owned and handled by its own component team and tracked separately rather
+      than gated here. See codec_policy.yaml for the full audit note.
+    owner: DALI
+  - glob: "**/PyNvVideoCodec/libavutil.so*"
+    reason: >-
+      PyNvVideoCodec bundles libavutil (utility routines, no codec) to support its
+      NVDEC container demux path; the package ships no libavcodec. Decode runs on
+      NVDEC (libnvcuvid).
+    owner: PyNvVideoCodec
+  - glob: "**/PyNvVideoCodec/libavformat.so*"
+    reason: >-
+      PyNvVideoCodec bundles libavformat (container demuxers/muxers only, no codec)
+      to parse the input container before NVDEC decode. Companion waiver to the
+      PyNvVideoCodec libavutil entry above.
+    owner: PyNvVideoCodec

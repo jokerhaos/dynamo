@@ -41,6 +41,22 @@ import sys
 
 import pytest
 
+# The internal full-media SGLang variant (context.yaml
+# sglang.enable_full_media_stack → templates/sglang_runtime.Dockerfile) ships
+# Ubuntu's complete ffmpeg — libx264 and AAC encoders included — as a
+# deliberate product decision for the MiniMax-H3 serving path, whose output
+# encoder hard-codes them. That variant's build carries the complementary
+# POSITIVE capability guard (the build fails when libx264 / aac / libvpx_vp9
+# encoders or ffprobe go missing), so this strict absence assertion is skipped
+# for that image only. Every other image keeps this test armed.
+if os.environ.get("DYNAMO_FULL_MEDIA_STACK") == "1":
+    pytest.skip(
+        "full-media runtime variant ships Ubuntu's complete ffmpeg by design; "
+        "its build-time capability guard is the positive counterpart of this "
+        "assertion",
+        allow_module_level=True,
+    )
+
 # Deliberately NO framework marker here. tests/conftest.py skips an item when any
 # framework marker it carries names a module that is absent, so listing all three
 # would mean "requires vllm AND sglang AND tensorrt_llm" -- true in no image, and

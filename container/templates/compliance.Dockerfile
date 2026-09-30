@@ -139,10 +139,23 @@ RUN python3 -m compliance.policy.validate \
 # the purge the gate depends on sits in the `device == "cuda"` block of
 # vllm_runtime.Dockerfile, so the XPU image still carries its base image's media
 # stack. Enable both together if that changes.
+#
+# Internal full-media variant (astro-web3 fork): when
+# enable_full_media_stack is set (sglang + cuda only), the scan runs against
+# codec_policy_full_media.yaml — same deny_globs (a codec library bundled into
+# a wheel under site-packages still fails the build) — but with reasoned
+# exceptions for the apt media stack the variant deliberately ships. That
+# policy also omits deny_components: the variant's ffmpeg is Ubuntu's
+# distro-managed build, outside the upstream in-tree security-floor scheme.
+# The variant flag is computed here (not inherited from the sglang runtime
+# template's own variable) because this template is also included from the
+# vllm/trtllm runtime templates, where that variable would otherwise be
+# undefined under StrictUndefined.
+{% set full_media = framework == "sglang" and device == "cuda" and context.sglang.get("enable_full_media_stack", "false") == "true" %}
 {% if device == "cuda" %}
 RUN python3 -m compliance.scan_codecs \
         --root / \
-        --policy /opt/compliance/policy/codec_policy.yaml \
+        --policy /opt/compliance/policy/{% if full_media %}codec_policy_full_media.yaml{% else %}codec_policy.yaml{% endif %} \
         --sbom /legal/osrb.cdx.json \
         --image {{ framework }}-{{ target }} \
         --fail-on-findings -v

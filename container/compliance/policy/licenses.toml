@@ -234,6 +234,10 @@ allow = [
   "FTL",                              # libfreetype6 — FreeType Project License
   "MIT-Modern-Variant",               # libfreetype6 — modern MIT phrasing
   "Libpng",                           # libpng16 — libpng's own permissive license
+  "TU-Berlin-2.0",                    # libgsm1 — TU Berlin permissive use notice (Jutta
+                                      # Degener / Carsten Bormann); surfaced by the
+                                      # full-media SGLang variant's ffmpeg closure,
+                                      # resolved via license_overrides.yaml
 ]
 
 # Hard denies: never ship these regardless of any other consideration.
@@ -2820,3 +2824,414 @@ type = "native"
 name = "CRIU"
 allow = ["GPL-2.0-only"]
 reason = "Mere aggregation: standalone checkpoint/restore binary the snapshot-agent execs as a subprocess, not linked into Dynamo's Apache-2.0 code. COPYING ships at /legal/CRIU/COPYING; source available via the OSRB archive."
+
+# UNKNOWN (need license_overrides.yaml, not exceptions): ['libgsm1']
+
+
+# UNKNOWN (need license_overrides.yaml, not exceptions): ['libgsm1']
+
+# --- Full-media SGLang variant (astro-web3 fork): ffmpeg 6.1.1 apt closure -------
+
+[[exceptions]]
+type = "dpkg"
+name = "ffmpeg"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libass9"
+allow = [
+          "GPL-2.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libavc1394-0"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libavcodec60"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libavdevice60"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libavfilter9"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libavformat60"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libavutil58"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libbluray2"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libbs2b0"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libcaca0"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libcdio-cdda2t64"
+allow = [
+          "GPL-3.0-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libcdio-paranoia2t64"
+allow = [
+          "GPL-3.0-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libcdio19t64"
+allow = [
+          "GPL-3.0-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libchromaprint1"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libcodec2-1.2"
+allow = [
+          "LGPL-2.1-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libdc1394-25"
+allow = [
+          "LGPL-2.1-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libflite1"
+allow = [
+          "GPL-2.0-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libgme0"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libiec61883-0"
+allow = [
+          "LGPL-2.1-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libjack-jackd2-0"
+allow = [
+          "GPL-2.0-only",
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libmp3lame0"
+allow = [
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libpocketsphinx3"
+allow = [
+          "GPL-2.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libpostproc57"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libpulse0"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libraw1394-11"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "librubberband2"
+allow = [
+          "GPL-2.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libsdl2-2.0-0"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libshine3"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.0-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libsndfile1"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libsoxr0"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libsphinxbase3t64"
+allow = [
+          "GPL-2.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libsrt1.5-gnutls"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libsvtav1enc1d1"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libswresample4"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libswscale7"
+allow = [
+          "GPL-2.0-or-later",
+          "GPL-3.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libtwolame0"
+allow = [
+          "LGPL-2.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libudfread0"
+allow = [
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libvidstab1.1"
+allow = [
+          "GPL-2.0-only",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libx264-164"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libx265-199"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libxvidcore4"
+allow = [
+          "GPL-2.0-or-later",
+          "LGPL-2.0-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libzvbi-common"
+allow = [
+          "GPL-2.0-only",
+          "GPL-2.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+
+[[exceptions]]
+type = "dpkg"
+name = "libzvbi0t64"
+allow = [
+          "GPL-2.0-only",
+          "GPL-2.0-or-later",
+          "LGPL-2.0-or-later",
+          "LGPL-2.1-or-later",
+        ]
+reason = "Media-stack package kept by the internal full-media SGLang variant (sglang.enable_full_media_stack); Ubuntu's ffmpeg 6.1.1 closure — dynamic aggregation"
+

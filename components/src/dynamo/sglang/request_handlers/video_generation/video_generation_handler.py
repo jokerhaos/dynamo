@@ -393,16 +393,19 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
                         seconds,
                     ),
                 )
-        finally:
+        except BaseException:
             shutil.rmtree(output_dir, ignore_errors=True)
+            raise
 
         # DiffGenerator.generate() returns GenerationResult | list[GenerationResult] | None
         if result is None:
+            shutil.rmtree(output_dir, ignore_errors=True)
             raise RuntimeError("DiffGenerator returned None")
         if isinstance(result, list):
             result = result[0]
         frames = result.frames
         if frames:
+            shutil.rmtree(output_dir, ignore_errors=True)
             # Convert frames to video bytes
             video_bytes = await self._frames_to_video(frames, fps)
             return video_bytes
@@ -411,11 +414,15 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
         # in-memory frames (the pipeline already probed/validated the media).
         output_file = getattr(result, "output_file_path", None)
         if not output_file:
+            shutil.rmtree(output_dir, ignore_errors=True)
             raise RuntimeError(
                 "DiffGenerator returned neither frames nor an output file path"
             )
-        with open(output_file, "rb") as f:
-            video_bytes = f.read()
+        try:
+            with open(output_file, "rb") as f:
+                video_bytes = f.read()
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
         if not video_bytes:
             raise RuntimeError(f"DiffGenerator output file is empty: {output_file}")
         return video_bytes

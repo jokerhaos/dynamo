@@ -238,8 +238,14 @@ def test_video_sampling_kwargs_h3_contract_drops_transport_and_bridges_duration(
     assert "fps" not in kwargs
     assert "negative_prompt" not in kwargs
     assert "guidance_scale" not in kwargs
-    # The OpenAI seconds transport bridged into the model-native duration.
-    assert kwargs["target"] == {"duration_seconds": 5}
+    # The OpenAI seconds transport bridged into the model-native target:
+    # duration plus every shape part the transport knows (aspect ratio and
+    # short edge from the transport size).
+    assert kwargs["target"] == {
+        "duration_seconds": 5,
+        "aspect_ratio": "1344:768",
+        "short_edge": 768,
+    }
     assert kwargs["task"] == "t2va"
     assert kwargs["width"] == 1344
     assert kwargs["height"] == 768

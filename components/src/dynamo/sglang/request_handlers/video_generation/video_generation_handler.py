@@ -74,7 +74,18 @@ def build_sampling_params_kwargs(
         and "target" not in args
         and seconds is not None
     ):
-        args["target"] = {"duration_seconds": int(seconds)}
+        # MiniMax-H3's canonical request resolves timing and geometry from the
+        # target dict — duration_seconds plus the shape pair. Fill every part
+        # the transport actually knows: duration from `seconds`, aspect ratio
+        # and short edge from the transport `size`. Anything beyond stays the
+        # client's to send via media_passthrough (which lands in `args` above
+        # and wins over this default).
+        target: dict[str, Any] = {"duration_seconds": int(seconds)}
+        width, height = args.get("width"), args.get("height")
+        if isinstance(width, int) and isinstance(height, int):
+            target["aspect_ratio"] = f"{width}:{height}"
+            target["short_edge"] = min(width, height)
+        args["target"] = target
     return args
 
 

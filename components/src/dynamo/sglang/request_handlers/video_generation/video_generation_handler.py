@@ -8,6 +8,8 @@ import io
 import logging
 import os
 import random
+import shutil
+import tempfile
 import time
 from typing import Any, AsyncGenerator, Mapping, Optional
 
@@ -75,15 +77,16 @@ def build_sampling_params_kwargs(
         and seconds is not None
     ):
         # MiniMax-H3's canonical request resolves timing and geometry from the
-        # target dict — duration_seconds plus the shape pair. Fill every part
-        # the transport actually knows: duration from `seconds`, aspect ratio
-        # and short edge from the transport `size`. Anything beyond stays the
-        # client's to send via media_passthrough (which lands in `args` above
-        # and wins over this default).
+        # target dict — duration_seconds plus the shape pair. The aspect ratio
+        # accepts only a model-defined enum or "auto"; an arbitrary transport
+        # W:H (e.g. "1344:768") is rejected, so default to "auto" (the task
+        # profile's policy) and carry the transport short edge. Anything beyond
+        # stays the client's to send via media_passthrough (which lands in
+        # `args` above and wins over this default).
         target: dict[str, Any] = {"duration_seconds": int(seconds)}
         width, height = args.get("width"), args.get("height")
         if isinstance(width, int) and isinstance(height, int):
-            target["aspect_ratio"] = f"{width}:{height}"
+            target["aspect_ratio"] = "auto"
             target["short_edge"] = min(width, height)
         args["target"] = target
     return args
@@ -345,6 +348,7 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
         Returns:
             Video bytes (mp4 format).
         """
+        output_dir = tempfile.mkdtemp(prefix="dynamo-video-")
         # Build args for DiffGenerator
         args = {
             "prompt": prompt,
@@ -354,7 +358,14 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
             "num_frames": num_frames,
             "fps": fps,
             "num_inference_steps": num_inference_steps,
-            "save_output": False,  # We handle saving ourselves
+            # Clamp the arg to a temp dir. Frames-styled models still return
+            # in-memory frames and the temp dir is simply removed; file-styled
+            # contracts (MiniMax-H3 validates and delivers a decoded file)
+            # REQUIRE save_output + a non-empty output_path and return the
+            # file path instead.
+            "save_output": True,
+            "return_file_paths_only": True,
+            "output_path": output_dir,
             "guidance_scale": guidance_scale,
             "seed": seed if seed is not None else random.randint(0, 1000000),
         }
@@ -368,19 +379,22 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
             f"{num_inference_steps} steps, request_id={request_id}"
         )
 
-        # Serialize access -- DiffGenerator has mutable state (CUDA graph
-        # caches, shared config objects) and is not thread-safe.
-        async with self._generate_lock:
-            # Run in thread pool to avoid blocking event loop
-            result = await asyncio.to_thread(
-                self.generator.generate,
-                sampling_params_kwargs=build_sampling_params_kwargs(
-                    self._resolve_sampling_params_class(),
-                    args,
-                    passthrough,
-                    seconds,
-                ),
-            )
+        try:
+            # Serialize access -- DiffGenerator has mutable state (CUDA graph
+            # caches, shared config objects) and is not thread-safe.
+            async with self._generate_lock:
+                # Run in thread pool to avoid blocking event loop
+                result = await asyncio.to_thread(
+                    self.generator.generate,
+                    sampling_params_kwargs=build_sampling_params_kwargs(
+                        self._resolve_sampling_params_class(),
+                        args,
+                        passthrough,
+                        seconds,
+                    ),
+                )
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
 
         # DiffGenerator.generate() returns GenerationResult | list[GenerationResult] | None
         if result is None:
@@ -388,11 +402,22 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
         if isinstance(result, list):
             result = result[0]
         frames = result.frames
-        if not frames:
-            raise RuntimeError("DiffGenerator returned no frames")
+        if frames:
+            # Convert frames to video bytes
+            video_bytes = await self._frames_to_video(frames, fps)
+            return video_bytes
 
-        # Convert frames to video bytes
-        video_bytes = await self._frames_to_video(frames, fps)
+        # File-delivery contracts return the validated output file instead of
+        # in-memory frames (the pipeline already probed/validated the media).
+        output_file = getattr(result, "output_file_path", None)
+        if not output_file:
+            raise RuntimeError(
+                "DiffGenerator returned neither frames nor an output file path"
+            )
+        with open(output_file, "rb") as f:
+            video_bytes = f.read()
+        if not video_bytes:
+            raise RuntimeError(f"DiffGenerator output file is empty: {output_file}")
         return video_bytes
 
     async def _frames_to_video(

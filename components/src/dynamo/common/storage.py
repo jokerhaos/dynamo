@@ -34,10 +34,77 @@ S3:
 """
 
 import asyncio
+import os
 from typing import Optional
+from urllib.parse import urlparse
 
 import fsspec
 from fsspec.implementations.dirfs import DirFileSystem
+
+
+# Presigned GET URLs are the delivery contract for private-object media
+# stores: S3-style SigV4 presigning tops out at exactly 7 days, which is the
+# default here.
+PRESIGNED_URL_EXPIRES_S = 7 * 24 * 60 * 60
+
+
+def presign_s3_get_url(
+    fs_url: str,
+    storage_path: str,
+    expires_s: int = PRESIGNED_URL_EXPIRES_S,
+) -> Optional[str]:
+    """Presign a GET for an s3:// media object, or None when not applicable.
+
+    Reads the same ``FSSPEC_S3_*`` environment contract ``get_fs()`` exposes
+    (``FSSPEC_S3_KEY`` / ``FSSPEC_S3_SECRET`` credentials,
+    ``FSSPEC_S3_ENDPOINT_URL`` custom endpoint, optional
+    ``FSSPEC_S3_REGION_NAME``). The signing region falls back to the first
+    label of the endpoint host: OSS regional endpoints
+    (``oss-cn-shenzhen.aliyuncs.com``) must sign with ``oss-cn-shenzhen`` —
+    OSS rejects any other region in the SigV4 credential scope.
+
+    Signing is a local HMAC computation (botocore, present wherever s3fs is)
+    — no network, no service call. Returns None for non-s3 URLs or when the
+    credentials are absent; callers fall back to the plain media URL.
+    """
+    if not fs_url.startswith("s3://"):
+        return None
+    key = os.environ.get("FSSPEC_S3_KEY")
+    secret = os.environ.get("FSSPEC_S3_SECRET")
+    endpoint = os.environ.get("FSSPEC_S3_ENDPOINT_URL")
+    if not key or not secret or not endpoint:
+        return None
+
+    # fs_url is "s3://bucket/prefix" (get_fs's root_path is everything after
+    # the separator); the object key is that prefix joined with storage_path.
+    root = fs_url[len("s3://") :].strip("/")
+    bucket, _, prefix = root.partition("/")
+    object_key = f"{prefix}/{storage_path}" if prefix else storage_path
+
+    region = os.environ.get("FSSPEC_S3_REGION_NAME")
+    if not region:
+        host = urlparse(endpoint).hostname or ""
+        region = "us-east-1" if host.split(".")[0] == "s3" else host.split(".")[0]
+
+    # Local import: botocore rides with s3fs, but this module must stay
+    # importable where it is absent (e.g. unit-test environments).
+    import botocore.session
+    from botocore.config import Config
+
+    session = botocore.session.get_session()
+    client = session.create_client(
+        "s3",
+        aws_access_key_id=key,
+        aws_secret_access_key=secret,
+        endpoint_url=endpoint,
+        region_name=region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+    )
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": object_key},
+        ExpiresIn=expires_s,
+    )
 
 
 def get_fs(fs_url: str) -> DirFileSystem:

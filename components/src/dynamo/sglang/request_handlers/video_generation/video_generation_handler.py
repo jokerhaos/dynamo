@@ -16,7 +16,7 @@ from typing import Any, AsyncGenerator, Mapping, Optional
 import torch
 
 from dynamo._core import Context
-from dynamo.common.storage import upload_to_fs
+from dynamo.common.storage import get_media_url, presign_s3_get_url, upload_to_fs
 from dynamo.sglang.args import Config
 from dynamo.sglang.protocol import (
     CreateVideoRequest,
@@ -499,10 +499,17 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
             request_id: Request context ID.
 
         Returns:
-            URL for the uploaded video.
+            URL for the uploaded video. For s3:// media stores this is a
+            presigned GET URL (7 days) so clients can fetch the object from a
+            private bucket without credentials; other stores return the plain
+            ``{base_url}/{storage_path}`` URL.
         """
         storage_path = f"{request_id}.mp4"
-        return await upload_to_fs(self.fs, storage_path, video_bytes, self.base_url)
+        await upload_to_fs(self.fs, storage_path, video_bytes, self.base_url)
+        presigned = presign_s3_get_url(self.fs_url, storage_path)
+        if presigned:
+            return presigned
+        return get_media_url(self.fs, storage_path, self.base_url)
 
     def _encode_base64(self, video_bytes: bytes) -> str:
         """Encode video as base64 string"""

@@ -132,9 +132,16 @@ setup_env() {
     #
     # Use a per-step Unix domain socket so concurrent builds on the same
     # buildkit worker don't collide on the default TCP port 4226.
+    #
+    # SCCACHE_IDLE_TIMEOUT must be exported BEFORE --start-server: the server
+    # reads it at startup and sccache's default is 600s. Exporting it inside
+    # the started block was a no-op, so any RUN whose compile-free prefix
+    # (uv build of the pure-Python wheel) outlasts 10 minutes found the
+    # server gone at maturin's first rustc probe: "Failed to send data to or
+    # receive data from server" (deterministic ~612s in, twice in a row).
     echo 'export SCCACHE_SERVER_UDS="/tmp/sccache-$(mktemp -u XXXXXX).sock";'
+    echo 'export SCCACHE_IDLE_TIMEOUT=0;'
     echo 'if sccache --start-server; then'
-    echo '  export SCCACHE_IDLE_TIMEOUT=0;'
     echo '  export RUSTC_WRAPPER="sccache";'
 
     if [ "$mode" = "cmake" ]; then

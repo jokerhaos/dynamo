@@ -6,6 +6,7 @@ import base64
 import dataclasses
 import io
 import logging
+import os
 import random
 import time
 from typing import Any, AsyncGenerator, Mapping, Optional
@@ -125,25 +126,66 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
     def _resolve_sampling_params_class(self) -> Optional[type]:
         """The serving model's SamplingParams subclass, when resolvable.
 
-        Uses the same registry lookup SGLang's own
-        ``SamplingParams.from_user_sampling_params_args`` performs. A None
-        return (no pipeline_class_name, registry miss, older SGLang) makes
-        ``build_sampling_params_kwargs`` keep the legacy pass-through.
+        Uses the same resolution ladder SGLang's own
+        ``SamplingParams.from_user_sampling_params_args`` performs:
+        ``server_args.pipeline_class_name`` first, then the model index at
+        ``model_path`` (under ``model_subfolder`` when the pipeline set one —
+        MiniMax-H3's ``_load_config`` assigns it during load). A None return
+        keeps ``build_sampling_params_kwargs`` on the legacy pass-through.
         """
+        cached = getattr(self, "_sampling_params_class", None)
+        if cached is not None or getattr(
+            self, "_sampling_params_class_looked_up", False
+        ):
+            return cached
+        self._sampling_params_class_looked_up = True
         try:
+            from sglang.multimodal_gen.configs.sample.sampling_params import (
+                SamplingParams,
+            )
             from sglang.multimodal_gen.registry import get_pipeline_config_classes
         except ImportError:
             return None
-        class_name = getattr(self.generator.server_args, "pipeline_class_name", None)
-        if not class_name:
-            return None
+        server_args = self.generator.server_args
+        class_name = getattr(server_args, "pipeline_class_name", None)
+        if class_name:
+            try:
+                config_classes = get_pipeline_config_classes(class_name)
+            except Exception:
+                config_classes = None
+            if config_classes:
+                self._sampling_params_class = config_classes[1]
+                return self._sampling_params_class
+
+        # pipeline_class_name is absent on Dynamo's minimal diffusion stub,
+        # so resolve the same way SGLang does: read the model's own index and
+        # ask the registry. Prefer the partition folder the pipeline loader
+        # recorded (model_subfolder) over the bare repository root — the root
+        # layout of split checkpoints can carry a different class name.
         try:
-            config_classes = get_pipeline_config_classes(class_name)
+            model_path = getattr(server_args, "model_path", None)
+            subfolder = getattr(server_args, "model_subfolder", None)
+            if model_path and subfolder:
+                resolved: Any = SamplingParams.from_pretrained(
+                    os.path.join(model_path, subfolder),
+                    backend=getattr(server_args, "backend", None),
+                    model_id=getattr(server_args, "model_id", None),
+                )
+                self._sampling_params_class = type(resolved)
+                return self._sampling_params_class
+            if model_path:
+                resolved: Any = SamplingParams.from_pretrained(
+                    model_path,
+                    backend=getattr(server_args, "backend", None),
+                    model_id=getattr(server_args, "model_id", None),
+                )
+                self._sampling_params_class = type(resolved)
+                return self._sampling_params_class
         except Exception:
-            return None
-        if not config_classes:
-            return None
-        return config_classes[1]
+            logger.debug(
+                "SamplingParams.from_pretrained resolution failed", exc_info=True
+            )
+        return None
 
     async def generate(
         self, request: dict[str, Any], context: Context

@@ -301,6 +301,59 @@ def test_video_sampling_kwargs_unknown_class_passes_through_sans_none():
 
 
 @pytest.mark.asyncio
+async def test_video_handler_resolves_sampling_class_via_model_subfolder():
+    """pipeline_class_name is absent on the diffusion stub; the class must
+    resolve from the pipeline-loaded model index (model_subfolder path)."""
+    from dynamo.sglang.request_handlers.video_generation import (
+        video_generation_handler as vgh,
+    )
+
+    seen: list[str] = []
+    fake_sp = _H3LikeSamplingParams()
+
+    class _Registry:
+        def __call__(self, name):
+            return None  # only reached when pipeline_class_name is set
+
+    import sglang.multimodal_gen.registry as registry_mod
+    import sglang.multimodal_gen.configs.sample.sampling_params as sp_mod
+
+    def fake_from_pretrained(model_path, backend=None, model_id=None):
+        seen.append(model_path)
+        return fake_sp
+
+    handler = vgh.VideoGenerationWorkerHandler.__new__(vgh.VideoGenerationWorkerHandler)
+    handler.generator = SimpleNamespace(
+        server_args=SimpleNamespace(
+            pipeline_class_name=None,
+            model_path="/models/minimax-h3",
+            model_subfolder="FL2VA",
+            backend=None,
+            model_id=None,
+        )
+    )
+
+    import unittest.mock as mock
+
+    with (
+        mock.patch.object(registry_mod, "get_pipeline_config_classes", _Registry()),
+        mock.patch.object(
+            sp_mod.SamplingParams, "from_pretrained", staticmethod(fake_from_pretrained)
+        ),
+    ):
+        resolved = handler._resolve_sampling_params_class()
+
+    assert resolved is _H3LikeSamplingParams
+    assert seen == ["/models/minimax-h3/FL2VA"]
+    # Cached: the second resolution does not re-read the model index.
+    with mock.patch.object(
+        sp_mod.SamplingParams, "from_pretrained", staticmethod(fake_from_pretrained)
+    ):
+        fake_from_pretrained.side_effect = None
+    assert handler._resolve_sampling_params_class() is _H3LikeSamplingParams
+
+
+@pytest.mark.asyncio
 async def test_parse_args_forwards_diffusion_flags_to_video_stub(
     monkeypatch, mock_sglang_cli
 ):

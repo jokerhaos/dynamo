@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -174,6 +175,129 @@ def test_diffusion_generator_kwargs_without_overrides_keeps_tp_semantics():
 
     assert kwargs["num_gpus"] == 8
     assert "ulysses_degree" not in kwargs
+
+
+# --- video handler sampling-contract filtering ------------------------------
+
+
+@dataclasses.dataclass
+class _H3LikeSamplingParams:
+    """Fields resolved server-side use init=False, like MiniMaxH3SamplingParams."""
+
+    prompt: str | None = None
+    height: int = 512
+    width: int = 896
+    num_inference_steps: int = 50
+    num_frames: int = dataclasses.field(default=1, init=False)
+    fps: int = dataclasses.field(default=24, init=False)
+    negative_prompt: None = dataclasses.field(default=None, init=False)
+    guidance_scale: float = dataclasses.field(default=1.0, init=False)
+    task: str | None = None
+    target: dict | None = None
+
+
+@dataclasses.dataclass
+class _WanLikeSamplingParams:
+    prompt: str | None = None
+    num_frames: int = 16
+    fps: int = 16
+    negative_prompt: str | None = None
+    guidance_scale: float = 5.0
+
+
+def _video_transport_args() -> dict:
+    return {
+        "prompt": "a serene mountain lake at dawn",
+        "negative_prompt": None,
+        "height": 768,
+        "width": 1344,
+        "num_frames": 120,
+        "fps": 24,
+        "num_inference_steps": 50,
+        "save_output": False,
+        "guidance_scale": 5.0,
+        "seed": 42,
+    }
+
+
+def test_video_sampling_kwargs_h3_contract_drops_transport_and_bridges_duration():
+    from dynamo.sglang.request_handlers.video_generation.video_generation_handler import (
+        build_sampling_params_kwargs,
+    )
+
+    kwargs = build_sampling_params_kwargs(
+        _H3LikeSamplingParams,
+        _video_transport_args(),
+        {"task": "t2va"},
+        seconds=5,
+    )
+
+    # Timing/CFG fields are init=False on the model contract: passing any of
+    # them is the TypeError the handler used to crash with.
+    assert "num_frames" not in kwargs
+    assert "fps" not in kwargs
+    assert "negative_prompt" not in kwargs
+    assert "guidance_scale" not in kwargs
+    # The OpenAI seconds transport bridged into the model-native duration.
+    assert kwargs["target"] == {"duration_seconds": 5}
+    assert kwargs["task"] == "t2va"
+    assert kwargs["width"] == 1344
+    assert kwargs["height"] == 768
+    assert kwargs["num_inference_steps"] == 50
+    # The filtered set must be constructor-clean for the model contract.
+    _H3LikeSamplingParams(**kwargs)
+
+
+def test_video_sampling_kwargs_explicit_target_wins_over_seconds_bridge():
+    from dynamo.sglang.request_handlers.video_generation.video_generation_handler import (
+        build_sampling_params_kwargs,
+    )
+
+    kwargs = build_sampling_params_kwargs(
+        _H3LikeSamplingParams,
+        _video_transport_args(),
+        {"target": {"duration_seconds": 3, "source": "ref"}},
+        seconds=5,
+    )
+
+    assert kwargs["target"] == {"duration_seconds": 3, "source": "ref"}
+
+
+def test_video_sampling_kwargs_wan_contract_keeps_transport_fields():
+    from dynamo.sglang.request_handlers.video_generation.video_generation_handler import (
+        build_sampling_params_kwargs,
+    )
+
+    kwargs = build_sampling_params_kwargs(
+        _WanLikeSamplingParams,
+        _video_transport_args(),
+        {"guidance_scale": 7.5},
+        seconds=4,
+    )
+
+    assert kwargs["num_frames"] == 120
+    assert kwargs["fps"] == 24
+    # Passthrough overrides the transport default.
+    assert kwargs["guidance_scale"] == 7.5
+    assert "target" not in kwargs
+    _WanLikeSamplingParams(**kwargs)
+
+
+def test_video_sampling_kwargs_unknown_class_passes_through_sans_none():
+    from dynamo.sglang.request_handlers.video_generation.video_generation_handler import (
+        build_sampling_params_kwargs,
+    )
+
+    kwargs = build_sampling_params_kwargs(
+        None, _video_transport_args(), None, seconds=4
+    )
+
+    # Legacy behavior: no contract filtering, but None-valued entries dropped
+    # (passing them overrides the model's own defaults — and H3-style
+    # constructors reject them outright).
+    assert kwargs["num_frames"] == 120
+    assert "negative_prompt" not in kwargs
+    assert kwargs["prompt"] == "a serene mountain lake at dawn"
 
 
 @pytest.mark.asyncio

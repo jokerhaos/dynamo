@@ -217,6 +217,10 @@ class CreateVideoRequest(BaseModel):
     response_format: Optional[str] = "url"  # url or b64_json
     output_format: Optional[str] = None  # only mp4 is supported
     nvext: Optional[VideoNvExt] = None
+    # Frontend nests unknown top-level fields here (media_passthrough) so
+    # model-native extension fields (e.g. MiniMax-H3 task/target/conditions)
+    # reach the worker instead of being dropped by pydantic.
+    extra_args: Optional[dict] = None
 
 
 class VideoData(BaseModel):

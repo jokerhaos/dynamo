@@ -3,11 +3,12 @@
 
 import asyncio
 import base64
+import dataclasses
 import io
 import logging
 import random
 import time
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Mapping, Optional
 
 import torch
 
@@ -24,6 +25,56 @@ from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.handler_base import BaseGenerativeHandler
 
 logger = logging.getLogger(__name__)
+
+
+def build_sampling_params_kwargs(
+    sampling_params_class: Optional[type],
+    transport_args: dict[str, Any],
+    passthrough: Optional[Mapping[str, Any]],
+    seconds: Optional[int],
+) -> dict[str, Any]:
+    """Merge transport args into the model's sampling-params contract.
+
+    Models declare their own keywords via dataclass fields. H3-style contracts
+    mark timing (num_frames/fps) and CFG fields ``init=False`` — resolved
+    server-side — so passing them raises ``TypeError: __init__() got an
+    unexpected keyword argument``. Filter the shared transport kwargs to the
+    fields the model actually accepts, let the client's media_passthrough
+    extensions (task/target/conditions/...) override transport defaults, and
+    bridge the OpenAI ``seconds`` into the native duration field on contracts
+    that reject frame counts (MiniMax-H3 resolves timing from
+    ``target.duration_seconds``).
+
+    ``sampling_params_class=None`` (registry miss, older SGLang) keeps the
+    legacy pass-through behavior minus explicitly-None entries — no model
+    consumes a None kwarg, and dropping them restores the model's own defaults.
+    """
+    args = {key: value for key, value in transport_args.items() if value is not None}
+    if sampling_params_class is None:
+        return args
+
+    accepted = {
+        field.name for field in dataclasses.fields(sampling_params_class) if field.init
+    }
+    args.update(
+        {
+            key: value
+            for key, value in dict(passthrough or {}).items()
+            if key in accepted
+        }
+    )
+    args = {key: value for key, value in args.items() if key in accepted}
+
+    accepts_frames = "num_frames" in accepted
+    native_duration = "target" in accepted
+    if (
+        not accepts_frames
+        and native_duration
+        and "target" not in args
+        and seconds is not None
+    ):
+        args["target"] = {"duration_seconds": int(seconds)}
+    return args
 
 
 class VideoGenerationWorkerHandler(BaseGenerativeHandler):
@@ -68,8 +119,31 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
             del self.generator
         torch.cuda.empty_cache()
         logger.info("Video generation generator cleanup complete")
-        # Call parent cleanup for any base class cleanup
+        # Call parent cleanup for base class cleanup
         super().cleanup()
+
+    def _resolve_sampling_params_class(self) -> Optional[type]:
+        """The serving model's SamplingParams subclass, when resolvable.
+
+        Uses the same registry lookup SGLang's own
+        ``SamplingParams.from_user_sampling_params_args`` performs. A None
+        return (no pipeline_class_name, registry miss, older SGLang) makes
+        ``build_sampling_params_kwargs`` keep the legacy pass-through.
+        """
+        try:
+            from sglang.multimodal_gen.registry import get_pipeline_config_classes
+        except ImportError:
+            return None
+        class_name = getattr(self.generator.server_args, "pipeline_class_name", None)
+        if not class_name:
+            return None
+        try:
+            config_classes = get_pipeline_config_classes(class_name)
+        except Exception:
+            return None
+        if not config_classes:
+            return None
+        return config_classes[1]
 
     async def generate(
         self, request: dict[str, Any], context: Context
@@ -107,15 +181,16 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
                 raise ValueError("Size is required")
             width, height = self._parse_size(req.size)
 
-            # Calculate num_frames if not explicitly provided
-            if nvext.fps is None:
-                raise ValueError("FPS is required")
-            if nvext.num_frames is None:
-                if req.seconds is None:
-                    raise ValueError("Seconds is required")
-                num_frames = nvext.fps * req.seconds
-            else:
+            # Transport timing: fps only feeds the frame-count math and the
+            # output encode rate here; models that resolve canonical timing
+            # server-side drop num_frames in build_sampling_params_kwargs.
+            fps = nvext.fps or 24
+            if nvext.num_frames is not None:
                 num_frames = nvext.num_frames
+            elif req.seconds is not None:
+                num_frames = fps * req.seconds
+            else:
+                raise ValueError("Seconds or nvext.num_frames is required")
 
             # Generate video
             context_id = context.id()
@@ -133,13 +208,15 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
                 width=width,
                 height=height,
                 num_frames=num_frames,
-                fps=nvext.fps,
+                fps=fps,
+                seconds=req.seconds,
                 num_inference_steps=nvext.num_inference_steps,
                 guidance_scale=nvext.guidance_scale,
                 seed=nvext.seed,
                 request_id=context_id,
                 negative_prompt=nvext.negative_prompt,
                 input_reference=req.input_reference,
+                passthrough=(req.extra_args or {}).get("media_passthrough"),
             )
 
             video_data = []
@@ -194,6 +271,8 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
         request_id: str,
         negative_prompt: Optional[str] = None,
         input_reference: Optional[str] = None,
+        passthrough: Optional[Mapping[str, Any]] = None,
+        seconds: Optional[int] = None,
     ) -> bytes:
         """Generate video using SGLang DiffGenerator.
 
@@ -242,7 +321,12 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
             # Run in thread pool to avoid blocking event loop
             result = await asyncio.to_thread(
                 self.generator.generate,
-                sampling_params_kwargs=args,
+                sampling_params_kwargs=build_sampling_params_kwargs(
+                    self._resolve_sampling_params_class(),
+                    args,
+                    passthrough,
+                    seconds,
+                ),
             )
 
         # DiffGenerator.generate() returns GenerationResult | list[GenerationResult] | None

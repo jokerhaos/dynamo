@@ -32,6 +32,7 @@ from dynamo.sglang._compat import (
 )
 from dynamo.sglang.args import (
     _diffusion_generator_kwargs,
+    _extract_diffusion_overrides,
     _forward_pass_metrics_source,
     _normalize_multimodal_disaggregation_args,
     parse_args,
@@ -101,6 +102,109 @@ def test_diffusion_generator_kwargs_omits_unset_master_port():
 
     assert kwargs["num_gpus"] == 1
     assert "master_port" not in kwargs
+
+
+def test_extract_diffusion_overrides_space_and_equals_forms():
+    remaining = [
+        "--tp-size",
+        "2",
+        "--model-variant",
+        "fl2va",
+        "--ulysses-degree=8",
+        "--some-text-engine-flag",
+        "--performance-mode",
+        "speed",
+    ]
+    overrides, remaining = _extract_diffusion_overrides(remaining)
+
+    assert overrides == {
+        "model_variant": "fl2va",
+        "ulysses_degree": 8,
+        "performance_mode": "speed",
+    }
+    assert remaining == ["--tp-size", "2", "--some-text-engine-flag"]
+
+
+def test_extract_diffusion_overrides_last_occurrence_wins():
+    overrides, remaining = _extract_diffusion_overrides(
+        ["--ulysses-degree", "2", "--ulysses-degree", "8"]
+    )
+
+    assert overrides == {"ulysses_degree": 8}
+    assert remaining == []
+
+
+def test_extract_diffusion_overrides_requires_value():
+    with pytest.raises(ValueError, match="requires a value"):
+        _extract_diffusion_overrides(["--ulysses-degree"])
+
+
+def test_diffusion_generator_kwargs_scales_num_gpus_with_ulysses():
+    kwargs = _diffusion_generator_kwargs(
+        SimpleNamespace(
+            model_path="/models/minimax-h3",
+            tp_size=1,
+            dp_size=1,
+            nccl_port=30005,
+            diffusion_overrides={
+                "ulysses_degree": 8,
+                "model_variant": "ref2va",
+                "performance_mode": "memory",
+            },
+        )
+    )
+
+    assert kwargs["num_gpus"] == 8
+    assert kwargs["tp_size"] == 1
+    assert kwargs["ulysses_degree"] == 8
+    assert kwargs["model_variant"] == "ref2va"
+    assert kwargs["performance_mode"] == "memory"
+    assert kwargs["master_port"] == 30005
+
+
+def test_diffusion_generator_kwargs_without_overrides_keeps_tp_semantics():
+    kwargs = _diffusion_generator_kwargs(
+        SimpleNamespace(
+            model_path="/models/minimax-h3",
+            tp_size=8,
+            dp_size=1,
+            diffusion_overrides={},
+        )
+    )
+
+    assert kwargs["num_gpus"] == 8
+    assert "ulysses_degree" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_parse_args_forwards_diffusion_flags_to_video_stub(
+    monkeypatch, mock_sglang_cli
+):
+    async def no_fetch(_):
+        raise AssertionError("video worker must not re-fetch a local model")
+
+    monkeypatch.setattr("dynamo.sglang.args.fetch_model", no_fetch)
+    mock_sglang_cli(
+        "--model-path",
+        "/tmp",
+        "--video-generation-worker",
+        "--tp",
+        "1",
+        "--ulysses-degree",
+        "8",
+        "--model-variant=ref2va",
+    )
+
+    config = await parse_args(sys.argv[1:])
+
+    assert config.server_args.diffusion_overrides == {
+        "ulysses_degree": 8,
+        "model_variant": "ref2va",
+    }
+    kwargs = _diffusion_generator_kwargs(config.server_args)
+    assert kwargs["num_gpus"] == 8
+    assert kwargs["ulysses_degree"] == 8
+    assert kwargs["model_variant"] == "ref2va"
 
 
 def test_override_server_args_uses_declarative_resolution(monkeypatch):

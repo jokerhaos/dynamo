@@ -87,10 +87,24 @@ class Config:
         return self.server_args
 
 
+# Diffusion-only flags that never reach the SGLang text-engine ServerArgs
+# parser: it does not define them, so without the extraction below the flags
+# die as "unrecognized arguments" and DiffGenerator cannot be configured with
+# them. Maps the CLI flag to the sglang.multimodal_gen ServerArgs field name
+# plus the value type that field expects.
+DIFFUSION_FORWARDABLE_ARGS: dict[str, tuple[str, type]] = {
+    "--ulysses-degree": ("ulysses_degree", int),
+    "--model-variant": ("model_variant", str),
+    "--performance-mode": ("performance_mode", str),
+    "--quantization": ("quantization", str),
+}
+
+
 def _diffusion_generator_kwargs(server_args: Any) -> dict[str, Any]:
     """Translate Dynamo's SGLang config into DiffGenerator arguments."""
     tp_size = getattr(server_args, "tp_size", 1)
     dp_size = getattr(server_args, "dp_size", 1)
+    overrides = getattr(server_args, "diffusion_overrides", None) or {}
     kwargs = {
         "model_path": server_args.model_path,
         "num_gpus": tp_size * dp_size,
@@ -99,13 +113,58 @@ def _diffusion_generator_kwargs(server_args: Any) -> dict[str, Any]:
         "dist_timeout": getattr(server_args, "dist_timeout", None),
     }
 
+    # Sequence parallelism gives every ulysses rank its own process and GPU.
+    # The multimodal ServerArgs derives sp_degree from
+    # num_gpus // (tp_size * dp_size), so a TP1 + Ulysses8 deployment must
+    # carry num_gpus=8 — Dynamo's tp*dp product alone would describe a
+    # single-GPU layout and stranding the other seven.
+    ulysses_degree = overrides.get("ulysses_degree")
+    if ulysses_degree is not None and int(ulysses_degree) > 1:
+        kwargs["num_gpus"] = tp_size * dp_size * int(ulysses_degree)
+
     # The text-engine CLI names this --nccl-port; DiffGenerator v0.5.15+
     # names the same torch.distributed rendezvous setting ``master_port``.
     # Omit it when unset so SGLang retains its own default/settling behavior.
     if (master_port := getattr(server_args, "nccl_port", None)) is not None:
         kwargs["master_port"] = master_port
 
+    # The allowlist bounds the keys, so forwarded overrides can only add
+    # (never replace) the fields built above.
+    kwargs.update(overrides)
+
     return kwargs
+
+
+def _extract_diffusion_overrides(
+    unknown: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Pull diffusion-only flags out of the leftover CLI token stream.
+
+    ``unknown`` is otherwise fed to the SGLang text-engine parser, which
+    rejects these flags. Last occurrence wins, matching argparse. Tokens
+    outside the allowlist stay in the returned stream so the parser reports
+    them exactly as before.
+    """
+    overrides: dict[str, Any] = {}
+    remaining: list[str] = []
+    index = 0
+    while index < len(unknown):
+        token = unknown[index]
+        index += 1
+        flag, separator, inline_value = token.partition("=")
+        if flag not in DIFFUSION_FORWARDABLE_ARGS:
+            remaining.append(token)
+            continue
+        field, value_type = DIFFUSION_FORWARDABLE_ARGS[flag]
+        if separator:
+            raw_value = inline_value
+        else:
+            if index >= len(unknown):
+                raise ValueError(f"{flag} requires a value")
+            raw_value = unknown[index]
+            index += 1
+        overrides[field] = value_type(raw_value)
+    return overrides, remaining
 
 
 def _unsupported_fpm_trace_role(dynamo_config: DynamoConfig) -> Optional[str]:
@@ -401,6 +460,7 @@ async def parse_args(args: list[str]) -> Config:
 
     # Dealing with SGLang native configs
     temp_config_file = None
+    diffusion_overrides: dict[str, Any] = {}
     if dynamo_config.disagg_config and dynamo_config.disagg_config_key:
         section_data = _load_disagg_config_section(
             dynamo_config.disagg_config, dynamo_config.disagg_config_key
@@ -420,6 +480,15 @@ async def parse_args(args: list[str]) -> Config:
 
         unknown = _normalize_multimodal_disaggregation_args(unknown, dynamo_config)
         dynamo_config.validate_multimodal_topology()
+
+        # The SGLang text-engine parser below rejects diffusion-only flags
+        # (e.g. --ulysses-degree), so lift them out first for diffusion
+        # workers; other worker types keep the hard failure on unknown args.
+        if (
+            dynamo_config.image_diffusion_worker
+            or dynamo_config.video_generation_worker
+        ):
+            diffusion_overrides, unknown = _extract_diffusion_overrides(unknown)
 
         parsed_args = sglang_only_parser.parse_args(unknown)
     finally:
@@ -610,6 +679,9 @@ async def parse_args(args: list[str]) -> Config:
         # without this copy the stub never carries it and --dist-timeout is
         # silently dropped for diffusion workers.
         server_args.dist_timeout = getattr(parsed_args, "dist_timeout", None)
+        # Diffusion-only flags lifted out of the text-engine token stream;
+        # _diffusion_generator_kwargs merges them into the DiffGenerator call.
+        server_args.diffusion_overrides = diffusion_overrides
         server_args.speculative_algorithm = None
         server_args.disaggregation_mode = None
         server_args.dllm_algorithm = False

@@ -10,13 +10,19 @@
 # or upstream Docker registry pipelines this fork doesn't have.
 #
 # Network: the runner reaches domestic mirrors (rsproxy for crates, aliyun for
-# pypi, gh-proxy for github) but NOT github.com / crates.io / pypi.org /
-# static.rust-lang.org directly. Each rust job writes a cargo config pointing
-# crates.io at rsproxy's sparse index with git-fetch-with-cli, plus a global
-# git insteadOf that routes every github clone through gh-proxy. The rust
-# toolchain is installed on the fly from rsproxy (rustup-init), so the runner
-# image does not need rust pre-baked. C/cc/protoc/openssl build deps are
-# installed at job start with `sudo apt-get install` (the runner runs as a
+# pypi) but NOT crates.io / pypi.org / static.rust-lang.org directly. The repo
+# checkouts clone token-authenticated straight from github.com: the runner
+# already talks to github.com for the Actions API, and gh-proxy no longer
+# forwards Basic auth for git-upload-pack — a valid token gets 401 through
+# the proxy (200 direct to github.com), so proxy-routed private-repo fetches
+# die on a username prompt with no tty. Public-repo tooling clones —
+# pre-commit hook envs and cargo git dependencies — still route anonymously
+# through gh-proxy, which serves those fine, via a global git insteadOf set
+# after checkout. Each rust job writes a cargo config pointing crates.io at
+# rsproxy's sparse index with git-fetch-with-cli. The rust toolchain is
+# installed on the fly from rsproxy (rustup-init), so the runner image does
+# not need rust pre-baked. C/cc/protoc/openssl build deps are installed at
+# job start with `sudo apt-get install` (the runner runs as a
 # passwordless-sudo user, apt sources already point at the TUNA ubuntu mirror);
 # because runner pods are ephemeral this doesn't pollute the base runner image.
 #
@@ -89,28 +95,28 @@ jobs:
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
-          # Route github egress through the domestic proxy from the first
-          # byte and bound every transfer. This step runs BEFORE the later
-          # gh-proxy step, and a cold mirror seed would otherwise sit on a
-          # direct github.com connection this runner cannot reliably open —
-          # git hangs forever without a low-speed cutoff, and the wedged
-          # checkout then also holds the mirror flock, backing up every
-          # later run on the node. The token rides an extra header (an
-          # insteadOf rewrite does not match userinfo URLs, and gh-proxy
-          # passes Authorization through — verified 200 on git-upload-pack).
-          git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
+          # Clone straight from github.com with the job token in the URL
+          # userinfo — the proven internal-build-push approach. gh-proxy no
+          # longer forwards Basic auth for git-upload-pack (verified: a valid
+          # token gets 401 through the proxy, 200 direct to github.com;
+          # anonymous public-repo clones still pass through it), so the old
+          # insteadOf→gh-proxy + Authorization-extraheader checkout failed
+          # every run with "could not read Username for
+          # 'https://gh-proxy.com'". The runner does reach github.com — it
+          # polls the Actions API — and token-authenticated git is not
+          # rate-limited. Keep the low-speed cutoff: a stalled checkout must
+          # fail loudly instead of wedging the mirror flock and backing up
+          # every later run on the node.
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
-          AUTH="Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          gitc(){ git -c "http.https://github.com/.extraheader=$AUTH" -c "http.https://gh-proxy.com/.extraheader=$AUTH" "$@"; }
-          url="https://github.com/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
-          seed(){ rm -rf "$MIRROR" && gitc clone --no-tags --depth "$DEPTH" --filter=blob:none "$url" "$MIRROR"; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" --filter=blob:none "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            gitc -C "$MIRROR" fetch --filter=blob:none --depth "$DEPTH" --no-tags origin "$GITHUB_SHA" && gitc -C "$MIRROR" checkout -f "$GITHUB_SHA"
+            git -C "$MIRROR" fetch --filter=blob:none --depth "$DEPTH" --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
           }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
@@ -134,7 +140,7 @@ jobs:
             cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
           else
             echo "::notice::no /cache/repos volume — direct partial clone"
-            gitc clone --no-tags --depth "$DEPTH" --filter=blob:none --no-checkout "$url" .
+            git clone --no-tags --depth "$DEPTH" --filter=blob:none --no-checkout "$url" .
             git sparse-checkout init --cone
             git sparse-checkout set $SPARSE
             git checkout -f "$GITHUB_SHA"
@@ -158,16 +164,15 @@ jobs:
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
-          # Same rationale as the changed-files mirror: proxy + low-speed
-          # cutoff from the first byte, token via extra header. A cold seed
-          # direct to github.com hangs forever without the cutoff, and the
-          # wedged checkout holds the mirror flock besides.
-          git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
+          # Same rationale as the changed-files mirror: token in URL
+          # userinfo direct to github.com + low-speed cutoff. gh-proxy no
+          # longer forwards Basic auth for git-upload-pack (401 with a valid
+          # token; anonymous public-repo clones still pass), so
+          # proxy-routed private-repo fetches die on a username prompt
+          # with no tty.
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
-          AUTH="Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          gitc(){ git -c "http.https://github.com/.extraheader=$AUTH" -c "http.https://gh-proxy.com/.extraheader=$AUTH" "$@"; }
-          url="https://github.com/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
@@ -177,10 +182,10 @@ jobs:
           # delta by SHA. No sparse — pre-commit --all-files walks the whole tree
           # (validate-skills → .agents/skills, the docs/fern/* scripts, default
           # trailing-whitespace/EOF hooks).
-          seed(){ rm -rf "$MIRROR" && gitc clone --no-tags --depth 1 "$url" "$MIRROR"; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            gitc -C "$MIRROR" fetch --depth 1 --no-tags origin "$GITHUB_SHA" && gitc -C "$MIRROR" checkout -f "$GITHUB_SHA"
+            git -C "$MIRROR" fetch --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
           }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
@@ -202,7 +207,7 @@ jobs:
             cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
           else
             echo "::notice::no /cache/repos volume — direct shallow clone"
-            gitc clone --no-tags --depth 1 "$url" .
+            git clone --no-tags --depth 1 "$url" .
             git checkout -f "$GITHUB_SHA"
           fi
       - name: Install python3-venv (sudo; pod is ephemeral, no base-image pollution)
@@ -259,23 +264,22 @@ jobs:
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
-          # Same rationale as the changed-files mirror: proxy + low-speed
-          # cutoff from the first byte, token via extra header — a cold
-          # seed direct to github.com hangs forever without the cutoff and
-          # holds the mirror flock besides.
-          git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
+          # Same rationale as the changed-files mirror: token in URL
+          # userinfo direct to github.com + low-speed cutoff — gh-proxy no
+          # longer forwards Basic auth for git-upload-pack (401 with a valid
+          # token; anonymous public-repo clones still pass), so
+          # proxy-routed private-repo fetches die on a username prompt
+          # with no tty.
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
-          AUTH="Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          gitc(){ git -c "http.https://github.com/.extraheader=$AUTH" -c "http.https://gh-proxy.com/.extraheader=$AUTH" "$@"; }
-          url="https://github.com/${GITHUB_REPOSITORY}.git"
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
-          seed(){ rm -rf "$MIRROR" && gitc clone --no-tags --depth 1 --filter=blob:none "$url" "$MIRROR"; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 --filter=blob:none "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            gitc -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && gitc -C "$MIRROR" checkout -f "$GITHUB_SHA"
+            git -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
           }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
@@ -299,7 +303,7 @@ jobs:
             cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
           else
             echo "::notice::no /cache/repos volume — direct partial clone"
-            gitc clone --no-tags --depth 1 --filter=blob:none --no-checkout "$url" .
+            git clone --no-tags --depth 1 --filter=blob:none --no-checkout "$url" .
             git sparse-checkout init --cone
             git sparse-checkout set $SPARSE
             git checkout -f "$GITHUB_SHA"

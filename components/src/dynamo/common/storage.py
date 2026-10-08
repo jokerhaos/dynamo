@@ -41,7 +41,6 @@ from urllib.parse import urlparse
 import fsspec
 from fsspec.implementations.dirfs import DirFileSystem
 
-
 # Presigned GET URLs are the delivery contract for private-object media
 # stores: S3-style SigV4 presigning tops out at exactly 7 days, which is the
 # default here.

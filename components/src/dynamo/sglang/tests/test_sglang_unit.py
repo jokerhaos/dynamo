@@ -3,11 +3,11 @@
 
 """Unit tests for SGLang backend components."""
 
+import dataclasses
 import logging
 import os
 import re
 import sys
-import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -321,8 +321,8 @@ async def test_video_handler_resolves_sampling_class_via_model_subfolder():
         def __call__(self, name):
             return None  # only reached when pipeline_class_name is set
 
-    import sglang.multimodal_gen.registry as registry_mod
     import sglang.multimodal_gen.configs.sample.sampling_params as sp_mod
+    import sglang.multimodal_gen.registry as registry_mod
 
     def fake_from_pretrained(model_path, backend=None, model_id=None):
         seen.append(model_path)

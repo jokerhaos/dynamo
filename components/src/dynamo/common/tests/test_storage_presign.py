@@ -12,6 +12,7 @@ from dynamo.common.storage import PRESIGNED_URL_EXPIRES_S, presign_s3_get_url
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.core,
+    pytest.mark.gpu_0,
     pytest.mark.pre_merge,
 ]
 

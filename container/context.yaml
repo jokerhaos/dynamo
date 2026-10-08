@@ -125,7 +125,7 @@ sglang:
     base_image_tag: 25.11-cuda13.0-devel-ubuntu24.04
     # Includes tracing and AIV-883/885. Upgrade the Mooncake wheel during the
     # runtime build so it need not wait for another full SGLang image build.
-    runtime_image_tag: 3a11df056792
+    runtime_image_tag: 38cae39134c2
     # Baseline is the TRUE base of the third-party lmsysorg/sglang image,
     # nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04 (Docker Hub; CUDA_VERSION=13.0.3,
     # ubuntu24.04), NOT a self-baseline of lmsysorg/sglang.

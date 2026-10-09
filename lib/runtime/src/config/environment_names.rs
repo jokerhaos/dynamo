@@ -429,6 +429,17 @@ pub mod llm {
     /// Set to `0` or leave unset to disable the timeout (default: disabled).
     pub const DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS: &str = "DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS";
 
+    /// In-flight first-response deadline in seconds: when set, a streaming
+    /// request that has not observed its first backend event within this many
+    /// seconds of the response starting is cancelled (engine context killed,
+    /// inflight gauge released). Unlike the backend stream timeout this is a
+    /// kill-only deadline: no worker quarantine, no discovery changes. The
+    /// first observed output event permanently disarms it.
+    ///
+    /// Set to `0` or leave unset to disable (default: disabled).
+    pub const DYN_HTTP_INFLIGHT_FIRST_RESPONSE_TIMEOUT_SECS: &str =
+        "DYN_HTTP_INFLIGHT_FIRST_RESPONSE_TIMEOUT_SECS";
+
     /// Pre-commit peek window in milliseconds for the streaming chat/responses
     /// paths. Controls how long the frontend polls the engine stream for a
     /// synchronous backend error before committing HTTP 200.
@@ -996,6 +1007,7 @@ mod tests {
             llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
             llm::DYN_HTTP_OVERLOAD_STATUS_CODE,
             llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
+            llm::DYN_HTTP_INFLIGHT_FIRST_RESPONSE_TIMEOUT_SECS,
             llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS,
             llm::DYN_LORA_ENABLED,
             llm::DYN_LORA_PATH,

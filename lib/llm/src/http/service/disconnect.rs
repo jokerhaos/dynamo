@@ -43,6 +43,7 @@ use crate::http::service::error::SanitizedError;
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
 
 use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
+use dynamo_runtime::config::environment_names::llm::DYN_HTTP_INFLIGHT_FIRST_RESPONSE_TIMEOUT_SECS as INFLIGHT_FIRST_RESPONSE_TIMEOUT_ENV;
 
 /// Read the backend stream inactivity timeout from the environment.
 /// Returns `None` if unset or zero (timeout disabled).
@@ -57,6 +58,24 @@ pub fn backend_stream_timeout() -> Option<Duration> {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .map(|secs| Duration::from_secs(secs.saturating_mul(2)))
+}
+
+/// Read the in-flight first-response deadline from the environment.
+///
+/// Kill-only semantics: on expiry the engine context is killed so the request
+/// is cancelled and the inflight gauge is released, but the worker is NOT
+/// quarantined (unlike `DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS`, which drives
+/// `report_instance_down`). Intended as a bound on how long a parked / poisoned
+/// request can occupy pipeline admission before the server gives up on it,
+/// independent of client disconnect behavior. The first observed output event
+/// permanently disarms the deadline, so slow-but-live generations are safe once
+/// they start producing tokens.
+pub fn inflight_first_response_timeout() -> Option<Duration> {
+    std::env::var(INFLIGHT_FIRST_RESPONSE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
 }
 
 #[derive(Clone, Copy)]
@@ -304,6 +323,10 @@ type StreamErrorFormatter = fn(&(dyn std::error::Error + 'static)) -> (ErrorType
 struct StreamMonitorOptions {
     activity_rx: Option<mpsc::UnboundedReceiver<()>>,
     error_signal: Option<StreamErrorSignal>,
+    /// Kill-only deadline from response start to the first backend event.
+    /// Disarms permanently on the first observed output (stream event or
+    /// activity signal). None disables.
+    first_response_deadline: Option<Duration>,
 }
 
 fn openai_stream_error(_error: &(dyn std::error::Error + 'static)) -> (ErrorType, String) {
@@ -392,6 +415,14 @@ pub fn monitor_for_disconnects_with_activity(
     stream_handle: ConnectionHandle,
     activity_rx: mpsc::UnboundedReceiver<()>,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
+    let options = StreamMonitorOptions {
+        activity_rx: Some(activity_rx),
+        // First-response deadline is only armed on the activity-aware paths:
+        // they can disarm on the first observed output, so a live but slow
+        // generation is never cut once it starts producing.
+        first_response_deadline: inflight_first_response_timeout(),
+        ..Default::default()
+    };
     monitor_for_disconnects_with_timeout_error_and_keep_alive(
         stream,
         context,
@@ -399,10 +430,7 @@ pub fn monitor_for_disconnects_with_activity(
         stream_handle,
         backend_stream_timeout(),
         openai_stream_error,
-        StreamMonitorOptions {
-            activity_rx: Some(activity_rx),
-            ..Default::default()
-        },
+        options,
     )
 }
 
@@ -439,6 +467,7 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
     let StreamMonitorOptions {
         mut activity_rx,
         error_signal,
+        first_response_deadline,
     } = options;
 
     // Default to Cancelled: if the stream is dropped unexpectedly (e.g. client
@@ -454,8 +483,14 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
         // Recreating it for every token repeatedly clones a receiver and churns Notify state.
         let stopped = context.stopped();
         tokio::pin!(stopped);
+        let inactivity_timeout_secs = inactivity_timeout.map(|d| d.as_secs());
         let mut inactivity_deadline =
             inactivity_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        // One-shot from response start to the first observed backend output.
+        // Disarmed permanently once the first event/activity lands.
+        let first_response_timeout_secs = first_response_deadline.map(|d| d.as_secs());
+        let mut first_response_deadline = first_response_deadline
+            .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
             tokio::select! {
                 // Drain any ready SSE event before honoring a cancel or the
@@ -469,6 +504,7 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
                         Some(Ok(event)) => {
                             inactivity_deadline = inactivity_timeout
                                 .map(|timeout| tokio::time::Instant::now() + timeout);
+                            first_response_deadline = None;
                             yield event;
                         }
                         Some(Err(err)) => {
@@ -525,6 +561,7 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
                     if activity.is_some() {
                         inactivity_deadline = inactivity_timeout
                             .map(|timeout| tokio::time::Instant::now() + timeout);
+                        first_response_deadline = None;
                     } else {
                         activity_rx = None;
                     }
@@ -549,8 +586,33 @@ fn monitor_for_disconnects_with_timeout_error_and_keep_alive(
                         request_type = %inflight_guard.request_type(),
                         error_type = "response_timeout",
                         elapsed_ms = %inflight_guard.elapsed_ms(),
-                        timeout_secs = ?inactivity_timeout.map(|d| d.as_secs()),
+                        timeout_secs = ?inactivity_timeout_secs,
                         "backend stream inactivity timeout; killing engine context to release inflight gauge"
+                    );
+                    context.kill();
+                    break;
+                }
+                // Kill-only first-response deadline: bound how long a request may
+                // sit at pipeline admission (queued behind slow prefill, occupied by
+                // a zombie client, or otherwise pre-first-token) before the server
+                // gives up on it. No worker quarantine, no discovery side effects.
+                _ = async {
+                    match first_response_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    inflight_guard.mark_error(ErrorType::ResponseTimeout);
+                    stream_handle.disarm();
+                    tracing::warn!(
+                        request_id = %inflight_guard.request_id(),
+                        model = %inflight_guard.model(),
+                        endpoint = %inflight_guard.endpoint(),
+                        request_type = %inflight_guard.request_type(),
+                        error_type = "response_timeout",
+                        elapsed_ms = %inflight_guard.elapsed_ms(),
+                        timeout_secs = ?first_response_timeout_secs,
+                        "in-flight first-response deadline exceeded; killing engine context (kill-only, worker not quarantined)"
                     );
                     context.kill();
                     break;
@@ -1158,5 +1220,147 @@ mod tests {
         assert!(!body.contains("site-packages"), "leaked a filesystem path");
         assert!(!body.contains("panicked at"), "leaked panic text");
         assert!(!body.contains("ValueError"), "leaked exception type");
+    }
+
+    fn monitor_with_first_response_deadline(
+        stream: impl futures::Stream<Item = Result<Event, axum::Error>>,
+        context: Arc<dyn AsyncEngineContext>,
+        guard: InflightGuard,
+        handle: ConnectionHandle,
+        first_response_deadline: Option<Duration>,
+        activity_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    ) -> impl futures::Stream<Item = Result<Event, axum::Error>> {
+        let _ = &handle; // ownership transferred below via move into the monitor
+        monitor_for_disconnects_with_timeout_error_and_keep_alive(
+            stream,
+            context,
+            guard,
+            handle,
+            None, // inactivity timeout disabled; only the first-response arm runs
+            openai_stream_error,
+            StreamMonitorOptions {
+                activity_rx,
+                first_response_deadline,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_first_response_deadline_kills_hanging_stream() {
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            "first-response-deadline",
+            Endpoint::ChatCompletions,
+            true,
+            "req-frd-kill",
+        );
+        let context = Arc::new(MockContext::with_kill_tracking());
+        let engine_context: Arc<dyn AsyncEngineContext> = context.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_disabled(tx);
+
+        let monitored = monitor_with_first_response_deadline(
+            hanging_stream(),
+            engine_context,
+            guard,
+            handle,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+        let mut monitored = Box::pin(monitored);
+        // Drive the monitor: it must terminate itself after the deadline.
+        let saw_end = tokio::time::timeout(Duration::from_millis(500), async {
+            while monitored.next().await.is_some() {}
+        })
+        .await;
+
+        assert!(
+            saw_end.is_ok(),
+            "monitor did not terminate after the first-response deadline"
+        );
+        assert!(
+            context.killed.load(Ordering::SeqCst),
+            "engine context was not killed on first-response deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_activity_disarms_first_response_deadline() {
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            "first-response-deadline",
+            Endpoint::ChatCompletions,
+            true,
+            "req-frd-disarm",
+        );
+        let context = Arc::new(MockContext::with_kill_tracking());
+        let engine_context: Arc<dyn AsyncEngineContext> = context.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_disabled(tx);
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let monitored = monitor_with_first_response_deadline(
+            hanging_stream(),
+            engine_context,
+            guard,
+            handle,
+            Some(Duration::from_millis(50)),
+            Some(activity_rx),
+        );
+        let mut monitored = Box::pin(monitored);
+
+        // First observed output activity arrives before the deadline...
+        activity_tx.send(()).unwrap();
+        // ...so the deadline must be permanently disarmed.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drop(monitored);
+
+        assert!(
+            !context.killed.load(Ordering::SeqCst),
+            "context killed despite first activity disarming the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_stream_event_disarms_first_response_deadline() {
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            "first-response-deadline",
+            Endpoint::ChatCompletions,
+            true,
+            "req-frd-first-event",
+        );
+        let context = Arc::new(MockContext::with_kill_tracking());
+        let engine_context: Arc<dyn AsyncEngineContext> = context.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_disabled(tx);
+
+        // First event at 80ms; deadline at 150ms. The stream keeps producing
+        // well past the deadline, proving the disarm survives later events.
+        let monitored = monitor_with_first_response_deadline(
+            timed_token_stream(6, Duration::from_millis(80)),
+            engine_context,
+            guard,
+            handle,
+            Some(Duration::from_millis(150)),
+            None,
+        );
+        let mut monitored = Box::pin(monitored);
+        let saw_end = tokio::time::timeout(Duration::from_millis(2_000), async {
+            while let Some(event) = monitored.next().await {
+                assert!(event.is_ok(), "stream errored unexpectedly: {event:?}");
+            }
+        })
+        .await;
+
+        assert!(
+            saw_end.is_ok(),
+            "stream did not finish; deadline should never fire after the first event"
+        );
+        assert!(
+            !context.killed.load(Ordering::SeqCst),
+            "context killed despite first stream event disarming the deadline"
+        );
     }
 }

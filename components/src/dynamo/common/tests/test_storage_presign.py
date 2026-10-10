@@ -23,8 +23,8 @@ FAKE_ENV = {
 }
 
 
-def test_presign_default_expiry_is_seven_days():
-    assert PRESIGNED_URL_EXPIRES_S == 7 * 24 * 60 * 60
+def test_presign_default_expiry_is_three_days():
+    assert PRESIGNED_URL_EXPIRES_S == 3 * 24 * 60 * 60
 
 
 def test_presign_oss_url_shape(monkeypatch):

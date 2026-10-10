@@ -254,6 +254,12 @@ Unless a field is marked environment-only, it has both a CLI flag and an environ
   Environment variable: `DYN_MEDIA_OUTPUT_HTTP_URL`
 </ParamField>
 
+<ParamField path="--media-output-presign-expires-s" type="integer" default="259200 (3 days)">
+  Lifetime in seconds of the presigned GET URLs returned for `s3://` media outputs, so clients can fetch objects from a private bucket without credentials. Must be between 1 and 604800 (7 days, the SigV4 presigned-URL maximum).
+
+  Environment variable: `DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S`
+</ParamField>
+
 ## Fault tolerance
 
 <ParamField path="DYN_RUNTIME_INHIBITED_DURATION_SECS" type="integer" default="5">

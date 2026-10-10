@@ -154,6 +154,41 @@ def test_default_thinking_mode_cli(mode, monkeypatch):
     assert "DYN_DEFAULT_THINKING_MODE" in help_text
 
 
+def test_media_output_presign_expires_defaults_to_three_days(monkeypatch):
+    monkeypatch.delenv("DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S", raising=False)
+
+    config, help_text = _parse_runtime_args([])
+
+    assert config.media_output_presign_expires_s == 3 * 24 * 60 * 60
+    assert "--media-output-presign-expires-s" in help_text
+    assert "DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S" in help_text
+
+
+def test_media_output_presign_expires_supports_cli_and_env(monkeypatch):
+    monkeypatch.setenv("DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S", "3600")
+
+    env_config, _ = _parse_runtime_args([])
+    cli_config, _ = _parse_runtime_args(["--media-output-presign-expires-s", "60"])
+
+    assert env_config.media_output_presign_expires_s == 3600
+    assert cli_config.media_output_presign_expires_s == 60
+
+
+def test_media_output_presign_expires_rejects_nonpositive(monkeypatch):
+    monkeypatch.delenv("DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S", raising=False)
+
+    for raw in ("0", "-60"):
+        with pytest.raises(ValueError):
+            _parse_runtime_args(["--media-output-presign-expires-s", raw])
+
+
+def test_media_output_presign_expires_rejects_over_seven_days(monkeypatch):
+    monkeypatch.delenv("DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S", raising=False)
+
+    with pytest.raises(ValueError, match="7 days"):
+        _parse_runtime_args(["--media-output-presign-expires-s", str(8 * 24 * 60 * 60)])
+
+
 def test_default_thinking_mode_env(monkeypatch):
     monkeypatch.setenv("DYN_DEFAULT_THINKING_MODE", "disabled")
 

@@ -42,9 +42,10 @@ import fsspec
 from fsspec.implementations.dirfs import DirFileSystem
 
 # Presigned GET URLs are the delivery contract for private-object media
-# stores: S3-style SigV4 presigning tops out at exactly 7 days, which is the
-# default here.
-PRESIGNED_URL_EXPIRES_S = 7 * 24 * 60 * 60
+# stores. S3-style SigV4 presigning rejects anything beyond exactly 7 days;
+# the runtime config exposes the lifetime (--media-output-presign-expires-s,
+# DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S) and defaults it to 3 days.
+PRESIGNED_URL_EXPIRES_S = 3 * 24 * 60 * 60
 
 
 def presign_s3_get_url(

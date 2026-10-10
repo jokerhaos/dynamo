@@ -51,6 +51,7 @@ class DynamoRuntimeConfig(ConfigBase):
     output_modalities: List[str]
     media_output_fs_url: str = "file:///tmp/dynamo_media"
     media_output_http_url: Optional[str] = None
+    media_output_presign_expires_s: int = 3 * 24 * 60 * 60
     # Raw `--health-check-payload` value (JSON object string or `@/path/to/file.json`).
     # Honored only by the unified backend's `Worker`, where it overrides the engine's
     # default `health_check_payload()` for the runtime canary.
@@ -104,6 +105,16 @@ class DynamoRuntimeConfig(ConfigBase):
         if self.engine_request_limit is not None and self.engine_request_limit <= 0:
             raise ValueError(
                 f"--engine-request-limit must be a positive integer, got {self.engine_request_limit}"
+            )
+
+        # S3-style SigV4 presigning rejects anything beyond 7 days at URL-use
+        # time, so fail fast at startup instead of handing out dead links.
+        sigv4_max_expires_s = 7 * 24 * 60 * 60
+        if not 0 < self.media_output_presign_expires_s <= sigv4_max_expires_s:
+            raise ValueError(
+                f"--media-output-presign-expires-s must be between 1 and "
+                f"{sigv4_max_expires_s} seconds (7 days, the SigV4 presigned-URL "
+                f"maximum), got {self.media_output_presign_expires_s}"
             )
 
         os.environ["DYN_RESPONSE_PLANE"] = self.response_plane
@@ -390,6 +401,16 @@ class DynamoRuntimeArgGroup(ArgGroup):
             env_var="DYN_MEDIA_OUTPUT_HTTP_URL",
             default=None,
             help="Base URL for rewriting media file paths in responses (e.g. http://localhost:8000/media). If unset, returns raw filesystem paths.",
+        )
+        add_argument(
+            g,
+            flag_name="--media-output-presign-expires-s",
+            env_var="DYN_MEDIA_OUTPUT_PRESIGN_EXPIRES_S",
+            default=3 * 24 * 60 * 60,
+            arg_type=int,
+            help="Lifetime in seconds of presigned GET URLs returned for s3:// "
+            "media outputs. Must be between 1 and 604800 (7 days, the SigV4 "
+            "maximum).",
         )
 
         add_argument(

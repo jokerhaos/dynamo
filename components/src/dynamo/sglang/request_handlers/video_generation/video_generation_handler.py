@@ -123,6 +123,7 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
         self.fs = fs
         self.fs_url = config.dynamo_args.media_output_fs_url
         self.base_url = config.dynamo_args.media_output_http_url
+        self.presign_expires_s = config.dynamo_args.media_output_presign_expires_s
 
         logger.info(
             f"Video generation worker handler initialized with fs_url={self.fs_url}"
@@ -500,13 +501,16 @@ class VideoGenerationWorkerHandler(BaseGenerativeHandler):
 
         Returns:
             URL for the uploaded video. For s3:// media stores this is a
-            presigned GET URL (7 days) so clients can fetch the object from a
-            private bucket without credentials; other stores return the plain
-            ``{base_url}/{storage_path}`` URL.
+            presigned GET URL (lifetime from
+            ``--media-output-presign-expires-s``, default 3 days) so clients
+            can fetch the object from a private bucket without credentials;
+            other stores return the plain ``{base_url}/{storage_path}`` URL.
         """
         storage_path = f"{request_id}.mp4"
         await upload_to_fs(self.fs, storage_path, video_bytes, self.base_url)
-        presigned = presign_s3_get_url(self.fs_url, storage_path)
+        presigned = presign_s3_get_url(
+            self.fs_url, storage_path, expires_s=self.presign_expires_s
+        )
         if presigned:
             return presigned
         return get_media_url(self.fs, storage_path, self.base_url)

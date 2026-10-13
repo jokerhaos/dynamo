@@ -22,15 +22,14 @@ distlib>=0.3.7,<1
 filelock>=3.24.2,<5
 imageio-ffmpeg>=0.6.0  # binary skipped per --no-binary directive above
 joblib>=1.0,<1.6  # Keep the dependency-free support line for --no-deps installs
-# Refresh the upstream image's bundled mooncake wheel: older builds vendor a
-# stale Go dependency set inside libetcd_wrapper.so, and current wheels carry
-# the updated etcd client stack. The cu130 SGLang image installs the CUDA 13
-# distribution (mooncake-transfer-engine-cuda13, pinned to 0.3.12.post1 by its
-# Dockerfile). The generic project links libcudart.so.12 and ships the same
-# `mooncake` package, so flooring the generic name overlays the CUDA 13 build
-# with an unloadable one instead of upgrading it. CUDA only: stripped for the
-# XPU image in sglang_runtime.Dockerfile.
-mooncake-transfer-engine-cuda13>=0.3.13.post1,<0.4
+# Mooncake is deliberately NOT listed here. Upstream refreshes the image's
+# bundled wheel with `mooncake-transfer-engine-cuda13>=0.3.13.post1,<0.4`, but
+# this file installs with --force-reinstall against the public index, whose
+# newest wheel (0.3.13.post1) carries no native tracing -- it would overwrite
+# the traced wheel the runtime template pins from MOONCAKE_FIND_LINKS. The
+# fork's install step in sglang_runtime.Dockerfile force-reinstalls
+# mooncake-transfer-engine-cuda13==0.3.13.post2 (native-tracing build) from
+# the internal find-links index, which covers upstream's refresh intent.
 nltk>=3.10.3,<4
 packaging>=23.1,<27
 # The upstream SGLang image bundles pillow at an older patch release; floor it

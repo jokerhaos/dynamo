@@ -10,7 +10,8 @@ package openengine.v1;
 import "openengine/v1/kv.proto";
 import "openengine/v1/server.proto";
 
-message HealthRequest {
+message HealthRequest
+{
   // False means a lightweight readiness/liveness check. True asks the engine to
   // run a role-appropriate minimal inference probe and report it as a check.
   bool include_inference_probe = 1;
@@ -23,7 +24,8 @@ message HealthRequest {
   EngineRole role = 3;
 }
 
-message HealthResponse {
+message HealthResponse
+{
   HealthState state = 1;
   repeated HealthCheck checks = 2;
 }
@@ -36,14 +38,17 @@ enum HealthState {
   HEALTH_STATE_NOT_READY = 4;
 }
 
-message HealthCheck {
-  string name = 1; // grpc, scheduler, model, kv_connector, role, inference_probe
+message HealthCheck
+{
+  string name = 1;  // grpc, scheduler, model, kv_connector, role, inference_probe
   HealthState state = 2;
   string message = 3;
 }
 
-message AbortRequest {
-  oneof target {
+message AbortRequest
+{
+  oneof target
+  {
     string request_id = 1;
     KvSessionRef kv_session = 2;
     AllRequests all_requests = 3;
@@ -52,7 +57,8 @@ message AbortRequest {
 
 message AllRequests {}
 
-message AbortResponse {
+message AbortResponse
+{
   AbortStatus status = 1;
   string message = 2;
 }

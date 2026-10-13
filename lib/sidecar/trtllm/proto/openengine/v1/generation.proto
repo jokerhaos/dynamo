@@ -11,7 +11,8 @@ import "google/protobuf/struct.proto";
 import "openengine/v1/error.proto";
 import "openengine/v1/kv.proto";
 
-message TokenIds {
+message TokenIds
+{
   repeated uint32 ids = 1;
 }
 
@@ -26,22 +27,26 @@ enum Modality {
 // A single multimodal input. Exactly one `source` should be set. The engine
 // owns fetch, decode, and preprocessing, so pre-decoded or RDMA media
 // descriptors are not represented here.
-message MediaItem {
+message MediaItem
+{
   Modality modality = 1;
-  oneof source {
-    string url = 2; // http(s):// -- engine fetches
-    string data_uri = 3; // data:<mime>;base64,<...> -- engine decodes
-    bytes raw_bytes = 4; // pre-fetched bytes -- engine still preprocesses
+  oneof source
+  {
+    string url = 2;       // http(s):// -- engine fetches
+    string data_uri = 3;  // data:<mime>;base64,<...> -- engine decodes
+    bytes raw_bytes = 4;  // pre-fetched bytes -- engine still preprocesses
   }
-  string mime_type = 5; // optional, hints raw_bytes decode
-  string uuid = 6; // optional caller id / mm_hash
+  string mime_type = 5;  // optional, hints raw_bytes decode
+  string uuid = 6;       // optional caller id / mm_hash
 }
 
-message GenerateRequest {
+message GenerateRequest
+{
   string request_id = 1;
   string model = 2;
 
-  oneof input {
+  oneof input
+  {
     string prompt = 3;
     TokenIds token_ids = 4;
   }
@@ -71,7 +76,8 @@ message GenerateRequest {
   google.protobuf.Struct extra = 12;
 }
 
-message SamplingParams {
+message SamplingParams
+{
   optional double temperature = 1;
   optional double top_p = 2;
   optional int32 top_k = 3;
@@ -83,7 +89,8 @@ message SamplingParams {
   optional uint32 num_sequences = 9;
 }
 
-message StoppingOptions {
+message StoppingOptions
+{
   optional uint32 max_tokens = 1;
   optional uint32 min_tokens = 2;
   repeated StopCondition conditions = 3;
@@ -91,7 +98,8 @@ message StoppingOptions {
   optional bool include_stop_in_output = 5;
 }
 
-message ResponseOptions {
+message ResponseOptions
+{
   optional bool return_prompt_logprobs = 1;
   CandidateTokenSelection prompt_candidates = 2;
   optional bool return_output_logprobs = 3;
@@ -99,8 +107,10 @@ message ResponseOptions {
   optional uint32 prompt_logprob_start = 5;
 }
 
-message CandidateTokenSelection {
-  oneof selection {
+message CandidateTokenSelection
+{
+  oneof selection
+  {
     uint32 top_n = 1;
     TokenIds token_ids = 2;
     AllCandidates all = 3;
@@ -109,14 +119,17 @@ message CandidateTokenSelection {
 
 message AllCandidates {}
 
-message KvOptions {
+message KvOptions
+{
   KvSessionRef session = 1;
   optional bool bypass_prefix_cache = 2;
   optional string cache_salt = 3;
 }
 
-message StopCondition {
-  oneof condition {
+message StopCondition
+{
+  oneof condition
+  {
     string stop_text = 1;
     uint32 stop_token_id = 2;
   }
@@ -125,12 +138,14 @@ message StopCondition {
 // Constrained / guided decoding spec. At most one of `guide` should be set.
 // The engine enforces the constraint during sampling via its grammar backend
 // (xgrammar / outlines / llguidance); clients cannot apply it post-hoc.
-message GuidedDecoding {
-  oneof guide {
-    string json_schema = 1; // output conforms to this JSON schema
-    string regex = 2; // output matches this regex
-    string ebnf_grammar = 3; // output follows this EBNF / context-free grammar
-    string structural_tag = 4; // xgrammar structural-tag constraint (JSON string)
+message GuidedDecoding
+{
+  oneof guide
+  {
+    string json_schema = 1;     // output conforms to this JSON schema
+    string regex = 2;           // output matches this regex
+    string ebnf_grammar = 3;    // output follows this EBNF / context-free grammar
+    string structural_tag = 4;  // xgrammar structural-tag constraint (JSON string)
     ChoiceConstraint choice = 5;
     JsonObjectConstraint json_object = 6;
   }
@@ -139,18 +154,21 @@ message GuidedDecoding {
   string backend = 7;
 }
 
-message ChoiceConstraint {
+message ChoiceConstraint
+{
   repeated string choices = 1;
 }
 
 message JsonObjectConstraint {}
 
-message GenerateResponse {
+message GenerateResponse
+{
   string request_id = 1;
 
   // PromptOutput, PrefillReady, and EngineError are request-scoped.
   // TokenOutput and GenerationFinished are output-scoped.
-  oneof event {
+  oneof event
+  {
     PromptOutput prompt = 2;
     TokenOutput token = 3;
     PrefillReady prefill_ready = 4;
@@ -158,22 +176,25 @@ message GenerateResponse {
     EngineError error = 6;
   }
 
-  Usage usage = 10; // Cumulative request usage; only set on the final response.
+  Usage usage = 10;  // Cumulative request usage; only set on the final response.
 }
 
 // Request-scoped prompt token information, emitted at most once.
-message PromptOutput {
+message PromptOutput
+{
   repeated TokenInfo tokens = 1;
 }
 
 // An incremental output delta. Tokens and text are never cumulative.
-message TokenOutput {
-  optional uint32 output_index = 1; // Required, including for output zero.
+message TokenOutput
+{
+  optional uint32 output_index = 1;  // Required, including for output zero.
   repeated TokenInfo tokens = 2;
   string text = 3;
 }
 
-message TokenInfo {
+message TokenInfo
+{
   uint32 token_id = 1;
   string token = 2;
   optional double logprob = 3;
@@ -181,26 +202,31 @@ message TokenInfo {
   repeated LogProb candidates = 5;
 }
 
-message LogProb {
+message LogProb
+{
   uint32 token_id = 1;
   double logprob = 2;
   string token = 3;
   optional uint32 rank = 4;
 }
 
-message PrefillReady {
+message PrefillReady
+{
   KvSessionRef kv_session = 1;
 }
 
-message GenerationFinished {
-  optional uint32 output_index = 1; // Required, including for output zero.
+message GenerationFinished
+{
+  optional uint32 output_index = 1;  // Required, including for output zero.
   FinishReason reason = 2;
   string message = 3;
   StopMatch stop_match = 4;
 }
 
-message StopMatch {
-  oneof match {
+message StopMatch
+{
+  oneof match
+  {
     uint32 stop_token_id = 1;
     string stop_text = 2;
     uint32 eos_token_id = 3;
@@ -214,7 +240,8 @@ enum FinishReason {
   FINISH_REASON_CANCELLED = 3;
 }
 
-message Usage {
+message Usage
+{
   uint32 prompt_tokens = 1;
   uint32 completion_tokens = 2;
   uint32 total_tokens = 3;

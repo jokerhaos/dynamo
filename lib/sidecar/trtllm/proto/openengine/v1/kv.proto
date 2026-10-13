@@ -10,7 +10,8 @@ package openengine.v1;
 import "google/protobuf/struct.proto";
 import "openengine/v1/error.proto";
 
-message KvSessionRef {
+message KvSessionRef
+{
   string session_id = 1;
   string transfer_backend = 2;
   repeated KvEndpoint endpoints = 3;
@@ -22,13 +23,15 @@ message KvSessionRef {
   google.protobuf.Struct attributes_struct = 5;
 }
 
-message KvEndpoint {
+message KvEndpoint
+{
   string host = 1;
   uint32 port = 2;
-  string protocol = 3; // grpc, nixl, ucx, tcp, shm, etc.
+  string protocol = 3;  // grpc, nixl, ucx, tcp, shm, etc.
 }
 
-message KvConnectorInfo {
+message KvConnectorInfo
+{
   optional bool enabled = 1;
   string transfer_backend = 2;
   repeated KvEndpoint local_endpoints = 3;
@@ -39,60 +42,70 @@ message KvConnectorInfo {
   optional uint32 schema_version = 8;
 }
 
-message GetKvEventSourcesRequest {
+message GetKvEventSourcesRequest
+{
   repeated uint32 data_parallel_ranks = 1;
 }
 
-message GetKvEventSourcesResponse {
+message GetKvEventSourcesResponse
+{
   repeated KvEventSource sources = 1;
 }
 
-message KvEventSource {
-  string transport = 1; // grpc, zmq
+message KvEventSource
+{
+  string transport = 1;  // grpc, zmq
   // Connectable address. MUST use a routable host, never a bind wildcard.
   KvEndpoint endpoint_addr = 2;
   string topic = 3;
-  string replay_endpoint = 4; // optional, for ZMQ replay
+  string replay_endpoint = 4;  // optional, for ZMQ replay
   optional uint32 data_parallel_rank = 5;
-  string encoding = 6; // protobuf, msgpack
+  string encoding = 6;  // protobuf, msgpack
   optional uint32 schema_version = 7;
   optional uint32 buffer_steps = 8;
   optional uint32 hwm = 9;
   optional uint32 max_queue_size = 10;
 }
 
-message SubscribeKvEventsRequest {
+message SubscribeKvEventsRequest
+{
   repeated uint32 data_parallel_ranks = 1;
   bool include_snapshot = 2;
   uint64 start_sequence_number = 3;
 }
 
-message SubscribeKvEventsResponse {
-  oneof event {
+message SubscribeKvEventsResponse
+{
+  oneof event
+  {
     KvEventBatch batch = 1;
-    EngineError error = 2; // Terminal.
+    EngineError error = 2;  // Terminal.
   }
 }
 
-message KvEventBatch {
+message KvEventBatch
+{
   uint64 sequence_number = 1;
   uint64 timestamp_unix_nanos = 2;
   uint32 data_parallel_rank = 3;
   repeated KvEvent events = 4;
 }
 
-message KvEvent {
+message KvEvent
+{
   string request_id = 1;
   KvSessionRef kv_session = 2;
 
-  oneof event {
+  oneof event
+  {
     BlockStored block_stored = 10;
     BlockRemoved block_removed = 11;
     AllBlocksCleared all_blocks_cleared = 12;
   }
 }
 
-message BlockStored {
+message BlockStored
+{
   repeated KvBlockHash block_hashes = 1;
   KvBlockHash parent_block_hash = 2;
   repeated uint32 token_ids = 3;
@@ -108,7 +121,8 @@ message BlockStored {
   uint32 kv_cache_spec_sliding_window = 23;
 }
 
-message BlockRemoved {
+message BlockRemoved
+{
   repeated KvBlockHash block_hashes = 1;
   StorageMedium medium = 2;
   uint32 group_idx = 3;
@@ -116,12 +130,14 @@ message BlockRemoved {
 
 message AllBlocksCleared {}
 
-message KvBlockHash {
+message KvBlockHash
+{
   bytes value = 1;
-  string encoding = 2; // int64, string, bytes, engine_specific
+  string encoding = 2;  // int64, string, bytes, engine_specific
 }
 
-message OpaqueKeyTuple {
+message OpaqueKeyTuple
+{
   repeated string values = 1;
 }
 

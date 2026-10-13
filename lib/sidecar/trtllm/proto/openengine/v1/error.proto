@@ -9,10 +9,11 @@ package openengine.v1;
 
 // Accepted failures emit one terminal EngineError and close with OK.
 // Validation and transport failures use non-OK gRPC status instead.
-message EngineError {
+message EngineError
+{
   ErrorCode code = 1;
   string message = 2;
-  bool retryable = 3; // Retry may succeed without changing the request.
+  bool retryable = 3;  // Retry may succeed without changing the request.
 }
 
 enum ErrorCode {

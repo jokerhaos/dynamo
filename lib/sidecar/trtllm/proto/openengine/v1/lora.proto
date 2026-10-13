@@ -7,31 +7,37 @@ syntax = "proto3";
 
 package openengine.v1;
 
-message LoraAdapter {
+message LoraAdapter
+{
   int64 lora_id = 1;
   string lora_name = 2;
   string source_path = 3;
 }
 
-message LoadLoraRequest {
+message LoadLoraRequest
+{
   LoraAdapter adapter = 1;
 }
 
-message LoadLoraResponse {
+message LoadLoraResponse
+{
   LoraAdapter adapter = 1;
   bool already_loaded = 2;
 }
 
-message UnloadLoraRequest {
+message UnloadLoraRequest
+{
   string lora_name = 1;
 }
 
-message UnloadLoraResponse {
+message UnloadLoraResponse
+{
   LoraAdapter adapter = 1;
 }
 
 message ListLorasRequest {}
 
-message ListLorasResponse {
+message ListLorasResponse
+{
   repeated LoraAdapter adapters = 1;
 }

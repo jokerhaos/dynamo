@@ -257,7 +257,6 @@ def _native_payload_is_batched(native_payload: Mapping[str, Any]) -> bool:
     )
 
 
-
 def _native_session_request_id(
     native_payload: Mapping[str, Any], context_id: str
 ) -> str | None:

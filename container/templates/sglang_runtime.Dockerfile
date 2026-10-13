@@ -281,14 +281,19 @@ RUN --mount=type=bind,source=./container/deps/requirements.sglang.txt,target=/tm
 # equivalent purge in vllm_runtime.Dockerfile.
 {% if device == "cuda" %}
 RUN set -eux; \
+{%- if not full_media %}
     # SGLang 0.5.21's runtime image installs Ubuntu's full GPL/LGPL ffmpeg
     # dependency closure. Remove the packages (and their dpkg metadata) before
     # copying Dynamo's separately built VP9-only ffmpeg below. File deletion
     # alone is insufficient because the compliance generator inventories dpkg.
+    # Strict-only: the fork's full-media variant keeps the apt media stack
+    # (and the fork-built base may ship neither package at all, which would
+    # fail the purge).
     apt-get purge -y --auto-remove \
         ffmpeg \
         libwayland-server0; \
     rm -rf /var/lib/apt/lists/*; \
+{%- endif %}
     python3 -m pip uninstall --yes \
         av \
         decord \
@@ -324,12 +329,14 @@ RUN set -eux; \
         /usr/local/lib/pkgconfig/libsw*.pc \
         /usr/local/src/ffmpeg \
         /root/.cache/pip; \
+{%- if not full_media %}
     find /usr /opt /workspace /sgl-workspace -xdev \
         \( -type f -o -type l \) \
         \( -name 'libx264*.so*' -o -name 'libx265*.so*' \
         -o -name 'libopenh264*.so*' -o -name 'libfdk-aac*.so*' \
         -o -name 'libfaac*.so*' -o -name 'libvo-aacenc*.so*' \
         -o -name 'libaacplus*.so*' \) -delete; \
+{%- endif %}
     ldconfig
 
 {% if device == "cuda" and not full_media %}

@@ -12,6 +12,7 @@ from typing import Any, AsyncGenerator, AsyncIterator
 from dynamo._core import Context
 from dynamo.llm.exceptions import EngineShutdown
 from dynamo.sglang._compat import resolved_server_args
+from dynamo.sglang.capacity import sglang_dp_layout
 
 _CANCELLATION_POLL_MAX_DELAY_S = 0.05
 _CANCELLATION_ABORT_RETRY_LIMIT = 8
@@ -118,18 +119,20 @@ class CancellationMixin:
                         (next_item, cancellation_task),
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if cancellation_task in done:
+                        cancellation_task.result()
+                        drain_deadline = (
+                            asyncio.get_running_loop().time()
+                            + _CANCELLATION_DRAIN_TIMEOUT_S
+                        )
                     if next_item in done:
                         try:
                             yield next_item.result()
                         except StopAsyncIteration:
                             return
                         continue
-                    cancellation_task.result()
-                    drain_deadline = (
-                        asyncio.get_running_loop().time()
-                        + _CANCELLATION_DRAIN_TIMEOUT_S
-                    )
 
+                assert drain_deadline is not None
                 remaining = drain_deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     logging.warning(
@@ -356,7 +359,7 @@ class CancellationMixin:
             not dispatch_observed
             or getattr(server_args, "pp_size", 1) > 1
             or (
-                getattr(server_args, "enable_dp_attention", False)
+                sglang_dp_layout(server_args)[1]
                 and not getattr(
                     server_args, "enable_dp_attention_local_control_broadcast", False
                 )
@@ -432,31 +435,6 @@ class CancellationMixin:
             ordered_abort_task = None
             try:
                 if not cancellation_task.done():
-                    # A handler may be dropped before its monitor gets scheduled.
-                    # Abort an already-dispatched request synchronously, before
-                    # cancelling the stream can remove its tokenizer state. Never
-                    # send an early abort for a request still awaiting dispatch.
-                    if (
-                        submitted_request_id is not None
-                        and not request_id_future.done()
-                    ):
-                        tokenizer_manager = getattr(
-                            self.engine, "tokenizer_manager", None
-                        )
-                        registry = self._request_registry(
-                            tokenizer_manager, submitted_request_id
-                        )
-                        state = (
-                            registry.get(submitted_request_id)
-                            if registry is not None
-                            else None
-                        )
-                        if getattr(
-                            getattr(state, "time_stats", None),
-                            "api_server_dispatch_finish_time",
-                            None,
-                        ):
-                            self._abort_requests({submitted_request_id}, context)
                     logging.debug(
                         "Cancelling cancellation monitor task for SGLang Request ID %s, Context: %s",
                         request_id,

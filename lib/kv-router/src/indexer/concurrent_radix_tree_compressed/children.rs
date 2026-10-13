@@ -151,7 +151,7 @@ impl NodeChildren {
             return children.insert(key, child);
         }
 
-        let mut entries = Self::clone_compact_entries(current.as_ref());
+        let mut entries = Self::clone_compact_entries(current.as_ref(), 1);
         let previous = match entries.binary_search_by_key(&key, |entry| entry.hash) {
             Ok(index) => Some(std::mem::replace(&mut entries[index].node, child.clone())),
             Err(index) => {
@@ -203,7 +203,7 @@ impl NodeChildren {
                 }
             };
 
-            let mut entries = Self::clone_compact_entries(current.as_ref());
+            let mut entries = Self::clone_compact_entries(current.as_ref(), 1);
             entries.insert(
                 insert_index,
                 ChildEntry {
@@ -238,7 +238,7 @@ impl NodeChildren {
             }
         };
 
-        let mut entries = Self::clone_compact_entries(current.as_ref());
+        let mut entries = Self::clone_compact_entries(current.as_ref(), 0);
         let removed = entries.remove(remove_index);
         self.state.store(Arc::new(Self::compact_state(entries)));
         Some(removed.node)
@@ -261,27 +261,25 @@ impl NodeChildren {
     }
 
     /// Transfers the current state while the owning node's exclusive shape gate is held.
+    /// The suffix keeps its representation; the prefix restarts with compact children.
     pub(super) fn transfer_for_split(&self) -> Self {
         let current = self.state.load_full();
-        let replacement = match current.as_ref() {
-            ChildrenState::Sharded(_) => {
-                ChildrenState::Sharded(ShardedChildren::with_hasher(FxBuildHasher))
-            }
-            ChildrenState::Empty | ChildrenState::Singleton(_) | ChildrenState::Small(_) => {
-                ChildrenState::Empty
-            }
-        };
-        self.state.store(Arc::new(replacement));
+        self.state.store(Arc::new(ChildrenState::Empty));
         Self::from_state(current)
     }
 
-    fn clone_compact_entries(state: &ChildrenState) -> Vec<ChildEntry> {
-        match state {
-            ChildrenState::Empty => Vec::new(),
-            ChildrenState::Singleton(entry) => vec![entry.clone()],
-            ChildrenState::Small(children) => children.to_vec(),
+    /// Copies compact entries with room for `spare` more, so inserting a new key neither
+    /// grows the copy nor shrinks it again when it becomes a boxed slice.
+    fn clone_compact_entries(state: &ChildrenState, spare: usize) -> Vec<ChildEntry> {
+        let current: &[ChildEntry] = match state {
+            ChildrenState::Empty => &[],
+            ChildrenState::Singleton(entry) => std::slice::from_ref(entry),
+            ChildrenState::Small(children) => children,
             ChildrenState::Sharded(_) => unreachable!("sharded children are mutated in place"),
-        }
+        };
+        let mut entries = Vec::with_capacity(current.len() + spare);
+        entries.extend_from_slice(current);
+        entries
     }
 
     fn state_from_entries(entries: Vec<ChildEntry>) -> ChildrenState {
@@ -371,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn fifth_distinct_child_promotes_and_sharded_never_demotes() {
+    fn fifth_distinct_child_promotes_and_ordinary_mutations_do_not_demote() {
         let children = NodeChildren::from_map(FxHashMap::default());
 
         for key in 0..=SMALL_CHILD_LIMIT {
@@ -394,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn split_transfer_preserves_compact_and_sharded_history() {
+    fn split_transfer_compacts_prefix_and_preserves_suffix_children() {
         let compact = NodeChildren::from_map(FxHashMap::default());
         compact.insert(LocalBlockHash(1), child());
         compact.insert(LocalBlockHash(2), child());
@@ -409,13 +407,13 @@ mod tests {
         for key in 0..=SMALL_CHILD_LIMIT {
             sharded.insert(LocalBlockHash(key as u64), child());
         }
-        let sharded_suffix = sharded.transfer_for_split();
         assert_eq!(sharded.kind(), ChildrenKind::Sharded);
-        assert!(sharded.is_empty());
+        let sharded_suffix = sharded.transfer_for_split();
+        assert_eq!(sharded.kind(), ChildrenKind::Empty);
         assert_eq!(sharded_suffix.kind(), ChildrenKind::Sharded);
         assert_eq!(sharded_suffix.len(), SMALL_CHILD_LIMIT + 1);
         sharded.insert(LocalBlockHash(99), child());
-        assert_eq!(sharded.kind(), ChildrenKind::Sharded);
+        assert_eq!(sharded.kind(), ChildrenKind::Singleton);
     }
 
     #[test]
@@ -427,7 +425,7 @@ mod tests {
         }
 
         let stale = children.state.load_full();
-        let mut stale_entries = NodeChildren::clone_compact_entries(stale.as_ref());
+        let mut stale_entries = NodeChildren::clone_compact_entries(stale.as_ref(), 0);
         stale_entries.remove(0);
         let replacement = child();
         let replacement_index = stale_entries

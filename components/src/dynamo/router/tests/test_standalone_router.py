@@ -20,14 +20,28 @@ def stub_module(name: str, **attributes: object) -> types.ModuleType:
     return module
 
 
+def load_token_ids_module():
+    module_path = Path(__file__).parents[2] / "common" / "utils" / "token_ids.py"
+    spec = importlib.util.spec_from_file_location(
+        "dynamo.common.utils.token_ids", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_standalone_router_handler():
     placeholder_type = type("Placeholder", (), {})
     stubs = {
         "uvloop": stub_module("uvloop", run=lambda coroutine: coroutine),
         "dynamo": stub_module("dynamo"),
+        "dynamo.common": stub_module("dynamo.common"),
+        "dynamo.common.utils": stub_module("dynamo.common.utils"),
+        "dynamo.common.utils.token_ids": load_token_ids_module(),
         "dynamo.llm": stub_module(
             "dynamo.llm",
-            AicPerfConfig=placeholder_type,
+            AisPerfConfig=placeholder_type,
             KvRouter=placeholder_type,
             KvRouterConfig=placeholder_type,
         ),
@@ -35,7 +49,7 @@ def load_standalone_router_handler():
         "dynamo.router.args": stub_module(
             "dynamo.router.args",
             DynamoRouterConfig=placeholder_type,
-            build_aic_perf_config=lambda config: config,
+            build_ais_perf_config=lambda config: config,
             build_kv_router_config=lambda config: config,
             parse_args=lambda argv=None: argv,
         ),
@@ -220,7 +234,7 @@ async def test_generate_applies_model_fallback_when_missing() -> None:
 
     forwarded = router.generate_from_request.await_args.args[0]
     assert forwarded["model"] == "unknown"
-    assert forwarded["routing"] is None
+    assert forwarded.get("routing") is None
     assert forwarded["token_ids"] == [9]
 
 
@@ -274,9 +288,7 @@ async def test_push_matches_pull_and_preserves_context_and_metadata():
     assert yielded == []
     assert sender.outputs == pulled
     assert sender.closed
-    router.generate_from_request.assert_awaited_once_with(
-        {**request, "routing": None}, context=context
-    )
+    router.generate_from_request.assert_awaited_once_with(request, context=context)
 
 
 @pytest.mark.asyncio
@@ -339,3 +351,53 @@ async def test_push_forwards_first_frame_without_waiting_for_completion():
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_generate_forwards_request_and_response_fields() -> None:
+    handler, router = handler_with_router()
+    worker_output = {
+        "token_ids": [5],
+        "output_type": "image",
+        "content_parts": [{"type": "text", "text": "hi"}],
+        "worker_trace_link": {"trace_id": "t"},
+    }
+
+    async def worker_stream():
+        yield worker_output
+
+    router.generate_from_request.return_value = worker_stream()
+    request = {
+        "token_ids": [1, 2, 3, 4],
+        "dp_rank": 2,
+        "mm_routing_info": {"routing_token_ids": [9, 9]},
+        "kv_hint": {"source": "prefill"},
+        "agent_context": {"session_id": "s"},
+    }
+
+    results = [output async for output in handler.generate(request)]
+
+    assert results == [worker_output]
+    (forwarded,), _ = router.generate_from_request.call_args
+    assert forwarded == {
+        **request,
+        "model": "unknown",
+        "routing": {"dp_rank": 2},
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_forwards_packed_token_ids_untouched() -> None:
+    handler, router = handler_with_router()
+
+    async def worker_stream():
+        yield {"token_ids": [5]}
+
+    router.generate_from_request.return_value = worker_stream()
+    packed = b"".join(i.to_bytes(4, "little") for i in (1, 2, 3, 4))
+
+    async for _ in handler.generate({"token_ids": packed}):
+        pass
+
+    (forwarded,), _ = router.generate_from_request.call_args
+    assert forwarded["token_ids"] is packed

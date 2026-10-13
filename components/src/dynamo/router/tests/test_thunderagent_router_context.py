@@ -26,6 +26,12 @@ def load_thunderagent_router_handler():
     stubs = {
         "uvloop": stub_module("uvloop", run=lambda coroutine: coroutine),
         "dynamo": stub_module("dynamo"),
+        "dynamo.common": stub_module("dynamo.common"),
+        "dynamo.common.utils": stub_module("dynamo.common.utils"),
+        "dynamo.common.utils.token_ids": stub_module(
+            "dynamo.common.utils.token_ids",
+            token_ids_len=lambda value: len(value or ()),
+        ),
         "dynamo.llm": stub_module(
             "dynamo.llm",
             KvRouter=placeholder_type,
@@ -47,7 +53,7 @@ def load_thunderagent_router_handler():
         "dynamo.thunderagent_router.args": stub_module(
             "dynamo.thunderagent_router.args",
             ThunderAgentRouterConfig=placeholder_type,
-            build_aic_perf_config=lambda config: config,
+            build_ais_perf_config=lambda config: config,
             build_kv_router_config=lambda config: config,
             parse_args=lambda argv=None: argv,
         ),

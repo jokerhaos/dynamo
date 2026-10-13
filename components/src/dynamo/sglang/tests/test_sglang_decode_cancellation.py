@@ -15,7 +15,7 @@ from dynamo.sglang.request_handlers.llm.decode_handler import DecodeWorkerHandle
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.sglang,
-    pytest.mark.core,
+    pytest.mark.fault_tolerance,
     pytest.mark.gpu_0,
     pytest.mark.profiled_vram_gib(0),
     pytest.mark.pre_merge,
@@ -138,7 +138,7 @@ def decode_cancellation_case(monkeypatch):
     handler._priority_kwargs = lambda priority: {}
     monkeypatch.setattr(
         "dynamo.sglang.request_handlers.llm.decode_handler.require_reasoning_kwargs",
-        lambda *args: {},
+        lambda *args, **kwargs: {},
     )
 
     monkeypatch.setattr(
@@ -424,6 +424,87 @@ async def test_unsupported_runtime_uses_response_id_cancellation(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(5)
+@pytest.mark.parametrize(
+    ("public_request_id", "expected_request_id"),
+    [("session-request-2", "session-request-2"), (None, "dynamo-request")],
+)
+async def test_native_session_request_preserves_session_tree_ids(
+    decode_cancellation_case, public_request_id, expected_request_id
+):
+    case = decode_cancellation_case
+    native_payload = {"session_params": {"id": "session-1", "rid": "session-request-1"}}
+    if public_request_id is not None:
+        native_payload["rid"] = public_request_id
+    case.request["extra_args"] = {"sglang_tito": native_payload}
+    case.finish_without_cancel = True
+    case.allow_registration.set()
+
+    outputs = await asyncio.wait_for(
+        _collect(case.handler.generate(case.request, case.context)), timeout=1
+    )
+
+    assert outputs == []
+    assert case.native_request.rid == expected_request_id
+    assert case.native_request.session_params["rid"] == "session-request-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_native_session_cancellation_uses_confirmed_response_id(
+    decode_cancellation_case,
+):
+    case = decode_cancellation_case
+    case.request["extra_args"] = {
+        "sglang_tito": {
+            "rid": "session-request-2",
+            "session_params": {"id": "session-1", "rid": "session-request-1"},
+        }
+    }
+    case.first_response = True
+    case.allow_registration.set()
+
+    consumer = asyncio.create_task(
+        _collect(case.handler.generate(case.request, case.context))
+    )
+    try:
+        await asyncio.wait_for(case.first_response_consumed.wait(), timeout=1)
+        assert not case.abort_calls
+
+        case.cancelled.set()
+
+        outputs = await asyncio.wait_for(consumer, timeout=1)
+        assert case.abort_calls == [("session-request-2", False)]
+        assert (
+            outputs[0]["engine_data"]["sglang_response"]["meta_info"]["id"]
+            == "session-request-2"
+        )
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_decode_logs_internal_and_context_request_ids(
+    decode_cancellation_case, caplog
+):
+    caplog.set_level(logging.INFO)
+    case = decode_cancellation_case
+    case.finish_without_cancel = True
+    case.allow_registration.set()
+
+    await asyncio.wait_for(
+        _collect(case.handler.generate(case.request, case.context)), timeout=1
+    )
+
+    assert (
+        "Submitted SGLang Request ID: internal-request-id, Context: dynamo-request"
+        in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
 async def test_parallel_sampling_does_not_guess_sglang_child_request_ids(
     decode_cancellation_case,
 ):
@@ -485,6 +566,42 @@ async def test_cancelled_stream_drain_is_bounded(
     )
 
     assert outputs == []
+    assert "Timed out draining SGLang stream after cancellation" in caplog.messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_cancelled_stream_starts_deadline_when_chunk_is_already_ready(
+    decode_cancellation_case, monkeypatch, caplog
+):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(
+        "dynamo.sglang.request_handlers.cancellation._CANCELLATION_DRAIN_TIMEOUT_S",
+        0,
+    )
+
+    async def simultaneous_wait(awaitables, **_kwargs):
+        await asyncio.gather(*awaitables)
+        return set(awaitables), set()
+
+    monkeypatch.setattr(
+        "dynamo.sglang.request_handlers.cancellation.asyncio.wait",
+        simultaneous_wait,
+    )
+
+    async def buffered_stream():
+        yield {"chunk": 1}
+        yield {"chunk": 2}
+
+    cancellation_task = asyncio.create_task(asyncio.sleep(0))
+    await cancellation_task
+    stream = decode_cancellation_case.handler._stream_until_cancelled(
+        buffered_stream(), cancellation_task
+    )
+
+    assert await anext(stream) == {"chunk": 1}
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
     assert "Timed out draining SGLang stream after cancellation" in caplog.messages
 
 
@@ -996,6 +1113,7 @@ async def test_cancellation_monitor_preserves_abort_ordering(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(5)
 async def test_ordered_abort_stops_when_stream_ends_before_registration(
     decode_cancellation_case, caplog
 ):
@@ -1020,6 +1138,7 @@ async def test_ordered_abort_stops_when_stream_ends_before_registration(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(5)
 async def test_cancellation_monitor_logs_fallback_abort_failure(
     decode_cancellation_case, caplog
 ):
@@ -1046,6 +1165,7 @@ async def test_cancellation_monitor_logs_fallback_abort_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(5)
 async def test_shutdown_survives_ordered_abort_cleanup(decode_cancellation_case):
     case = decode_cancellation_case
     rid = "internal-request-id"
@@ -1068,73 +1188,3 @@ async def test_shutdown_survives_ordered_abort_cleanup(decode_cancellation_case)
 
     with pytest.raises(EngineShutdown):
         await operation
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5)
-@pytest.mark.parametrize("exit_kind", ["error", "close", "cancel"])
-async def test_stream_exit_before_monitor_runs_aborts_dispatched_request(
-    decode_cancellation_case, exit_kind
-):
-    """Dropping the handler must not strand a pre-first-output engine request."""
-    case = decode_cancellation_case
-    rid = "internal-request-id"
-    case.registry[rid] = SimpleNamespace(
-        time_stats=SimpleNamespace(api_server_dispatch_finish_time=1.0)
-    )
-    case.dispatched.set()
-    exception = {
-        "error": RuntimeError,
-        "close": GeneratorExit,
-        "cancel": asyncio.CancelledError,
-    }[exit_kind]
-    with pytest.raises(exception):
-        async with case.handler._cancellation_monitor(
-            asyncio.get_running_loop().create_future(),
-            case.context,
-            submitted_request_id=rid,
-        ):
-            # No scheduling point: the stream exits before its monitor can run.
-            raise exception()
-    assert case.abort_calls == [(rid, False)]
-    assert case.aborted.is_set()
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5)
-@pytest.mark.parametrize("registered", [False, True])
-async def test_stream_exit_does_not_abort_before_dispatch(
-    decode_cancellation_case, registered
-):
-    case = decode_cancellation_case
-    rid = "internal-request-id"
-    if registered:
-        case.registry[rid] = SimpleNamespace(
-            time_stats=SimpleNamespace(api_server_dispatch_finish_time=0.0)
-        )
-    with pytest.raises(GeneratorExit):
-        async with case.handler._cancellation_monitor(
-            asyncio.get_running_loop().create_future(),
-            case.context,
-            submitted_request_id=rid,
-        ):
-            raise GeneratorExit()
-    assert not case.abort_calls
-    assert not case.handler._abort_tasks
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(5)
-async def test_cancelled_consumer_aborts_before_first_output(decode_cancellation_case):
-    case = decode_cancellation_case
-    case.allow_registration.set()
-    consumer = asyncio.create_task(
-        _collect(case.handler.generate(case.request, case.context))
-    )
-    await asyncio.wait_for(case.dispatched.wait(), timeout=1)
-    consumer.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await consumer
-    assert case.abort_calls == [("internal-request-id", False)]
-    assert case.aborted.is_set()
-    assert not case.handler._abort_tasks

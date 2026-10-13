@@ -406,6 +406,40 @@ def _guided_output_requires_reasoning(
     return guided_decoding is not None and "structural_tag" in guided_decoding
 
 
+def _engine_reasoning_gate(
+    request: dict[str, Any],
+    force_reasoning: bool,
+    reasoning_parser_name: str | None = None,
+    guided_decoding: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether the SGLang engine reasoning gate should be on.
+
+    Follows _guided_output_requires_reasoning for every guided form (required
+    or named tool choices and auto structural-tag grammars on, legacy
+    constraints off, gpt-oss structured output off). Plain requests instead
+    keep this fork's contract (#17): a thinking request asks the engine to
+    account reasoning tokens, so meta_info.reasoning_tokens is reported
+    instead of staying 0.
+    """
+    if not force_reasoning:
+        return False
+
+    if legacy_guided_decoding(request):
+        return False
+
+    if _guided_output_requires_reasoning(
+        request, force_reasoning, reasoning_parser_name, guided_decoding
+    ):
+        return True
+
+    # Only the gpt-oss JSON gate and plain requests reach this point; the
+    # former stays off, and the latter is the fork's engine-accounting gate.
+    response_format = request.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") != "text":
+        return False
+    return True
+
+
 def _normalize_deepseek_v4_hint(value: Any) -> str:
     return str(value or "").lower().replace("-", "").replace("_", "")
 

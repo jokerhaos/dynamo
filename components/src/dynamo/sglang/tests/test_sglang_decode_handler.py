@@ -2204,6 +2204,7 @@ async def test_token_stream_usage_preserves_reasoning_tokens_per_choice():
                 "total_tokens": 7,
                 "completion_tokens_details": {"reasoning_tokens": 0},
             },
+            "engine_data": {"kv_cache_hit": {"prompt_tokens": 5, "reused_tokens": 0}},
         },
         {
             "index": 1,
@@ -2215,6 +2216,7 @@ async def test_token_stream_usage_preserves_reasoning_tokens_per_choice():
                 "total_tokens": 8,
                 "completion_tokens_details": {"reasoning_tokens": 2},
             },
+            "engine_data": {"kv_cache_hit": {"prompt_tokens": 5, "reused_tokens": 0}},
         },
         {
             "index": 2,
@@ -2225,6 +2227,7 @@ async def test_token_stream_usage_preserves_reasoning_tokens_per_choice():
                 "completion_tokens": 4,
                 "total_tokens": 9,
             },
+            "engine_data": {"kv_cache_hit": {"prompt_tokens": 5, "reused_tokens": 0}},
         },
     ]
 

@@ -366,6 +366,17 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
     eligibility: RoutingEligibility<'_>,
     block_size: u32,
 ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+    let selection_span = if tracing::Span::current().is_disabled() {
+        tracing::Span::none()
+    } else {
+        tracing::info_span!(
+            "kv_router.select_worker_policy",
+            dynamo.router.worker_id = tracing::field::Empty,
+            dynamo.router.dp_rank = tracing::field::Empty,
+            dynamo.router.cost = tracing::field::Empty,
+        )
+    };
+    let _entered = selection_span.enter();
     eligibility.validate_pinned_worker_allowed()?;
 
     if let Some(worker) = eligibility.pinned_worker() {
@@ -451,6 +462,9 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
         }
         return Err(KvSchedulerError::NoEndpoints);
     };
+    selection_span.record("dynamo.router.worker_id", worker.worker_id);
+    selection_span.record("dynamo.router.dp_rank", worker.dp_rank);
+    selection_span.record("dynamo.router.cost", cost);
     let result = selection_result(request, worker, block_size, input.max_raw_cached_tokens());
     log_selection(
         workers,

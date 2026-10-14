@@ -162,10 +162,12 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
         Ok(())
     }
 
-    fn score_worker(
+    #[inline]
+    fn score_worker<const TRACE: bool>(
         &mut self,
         context: &WorkerSelectionContext<'_>,
         candidate: WorkerCandidate<'_>,
+        score_span: &tracing::Span,
     ) -> Result<f64, WorkerSelectionPolicyError> {
         let load = candidate
             .load()
@@ -200,6 +202,20 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
                 + self.host_cache_hit_weight * cache.host_overlap_blocks()
                 + self.disk_cache_hit_weight * cache.disk_overlap_blocks()
                 + shared_credit;
+            if TRACE {
+                score_span.record("dynamo.router.device_overlap_blocks", device);
+                score_span.record(
+                    "dynamo.router.host_overlap_blocks",
+                    cache.host_overlap_blocks(),
+                );
+                score_span.record(
+                    "dynamo.router.disk_overlap_blocks",
+                    cache.disk_overlap_blocks(),
+                );
+                score_span.record("dynamo.router.cached_tokens", cached_tokens);
+                score_span.record("dynamo.router.shared_credit_blocks", shared_credit);
+                score_span.record("dynamo.router.cache_decay", decay);
+            }
             (cached_tokens, credit)
         } else {
             (0, 0.0)
@@ -221,9 +237,32 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
                 context.prompt_tokens()
             };
             let prefill = (self.prepared.block_size.divide(raw_tokens as f64) - credit).max(0.0);
+            if TRACE {
+                score_span.record("dynamo.router.prefill_cost_blocks", prefill);
+            }
             self.prefill_load_scale * prefill + load.decode_cost_blocks() + request_cost
         };
         let cost = logit * candidate.preferred_taint_multiplier().unwrap_or(1.0);
+        if TRACE {
+            score_span.record("dynamo.router.load_available", load.is_available());
+            score_span.record("dynamo.router.cache_available", candidate.cache().is_some());
+            score_span.record(
+                "dynamo.router.active_prefill_tokens",
+                load.active_prefill_tokens(),
+            );
+            score_span.record("dynamo.router.active_requests", load.active_requests());
+            score_span.record(
+                "dynamo.router.decode_cost_blocks",
+                load.decode_cost_blocks(),
+            );
+            score_span.record("dynamo.router.request_cost_blocks", request_cost);
+            score_span.record("dynamo.router.cache_credit_blocks", credit);
+            score_span.record(
+                "dynamo.router.preferred_taint_multiplier",
+                candidate.preferred_taint_multiplier().unwrap_or(1.0),
+            );
+            score_span.record("dynamo.router.cost", cost);
+        }
         Ok(cost)
     }
 }
@@ -248,10 +287,82 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool> WorkerScorer
         candidates: WorkerCandidates<'_>,
         costs: &mut [f64],
     ) -> Result<(), WorkerSelectionPolicyError> {
+        // Keep detailed telemetry bounded without changing which candidates are scored.
+        const TRACE_CANDIDATE_LIMIT: usize = 64;
+        let score_span = if tracing::Span::current().is_disabled() {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!(
+                "kv_router.score_candidates",
+                dynamo.router.candidate_count = candidates.len(),
+                dynamo.router.candidates_traced = tracing::field::Empty,
+                dynamo.router.candidates_truncated = candidates.len() > TRACE_CANDIDATE_LIMIT,
+                dynamo.router.prompt_tokens = context.prompt_tokens(),
+                dynamo.router.block_size = context.block_size(),
+                dynamo.router.request_blocks = context.request_blocks(),
+                dynamo.router.track_prefill = context.tracks_prefill_tokens(),
+                dynamo.router.overlap_credit_weight = tracing::field::Empty,
+                dynamo.router.overlap_credit_decay = self.overlap_score_credit_decay,
+                dynamo.router.host_cache_hit_weight = self.host_cache_hit_weight,
+                dynamo.router.disk_cache_hit_weight = self.disk_cache_hit_weight,
+                dynamo.router.shared_cache_multiplier = self.shared_cache_multiplier,
+                dynamo.router.prefill_load_scale = self.prefill_load_scale,
+                dynamo.router.decode_active_request_weight = self.decode_active_request_weight,
+                dynamo.router.decode_cache_subtraction = tracing::field::Empty,
+            )
+        };
+        let _entered = score_span.enter();
         self.prepare(context, candidates)?;
-        for (candidate, cost) in candidates.iter().zip(costs) {
-            *cost = self.score_worker(context, candidate)?;
+        score_span.record(
+            "dynamo.router.overlap_credit_weight",
+            self.prepared.overlap_credit,
+        );
+        score_span.record(
+            "dynamo.router.decode_cache_subtraction",
+            self.prepared.needs_decode_subtraction,
+        );
+        if score_span.is_disabled() {
+            for (candidate, cost) in candidates.iter().zip(costs) {
+                *cost = self.score_worker::<false>(context, candidate, &tracing::Span::none())?;
+            }
+            return Ok(());
         }
+        let mut traced = 0usize;
+        for (index, (candidate, cost)) in candidates.iter().zip(costs).enumerate() {
+            let candidate_span = if !score_span.is_disabled() && index < TRACE_CANDIDATE_LIMIT {
+                tracing::info_span!(
+                    "kv_router.score_candidate",
+                    dynamo.router.worker_id = candidate.worker().worker_id,
+                    dynamo.router.dp_rank = candidate.worker().dp_rank,
+                    dynamo.router.cache_available = tracing::field::Empty,
+                    dynamo.router.load_available = tracing::field::Empty,
+                    dynamo.router.device_overlap_blocks = tracing::field::Empty,
+                    dynamo.router.host_overlap_blocks = tracing::field::Empty,
+                    dynamo.router.disk_overlap_blocks = tracing::field::Empty,
+                    dynamo.router.cached_tokens = tracing::field::Empty,
+                    dynamo.router.shared_credit_blocks = tracing::field::Empty,
+                    dynamo.router.cache_decay = tracing::field::Empty,
+                    dynamo.router.cache_credit_blocks = tracing::field::Empty,
+                    dynamo.router.active_prefill_tokens = tracing::field::Empty,
+                    dynamo.router.active_requests = tracing::field::Empty,
+                    dynamo.router.decode_cost_blocks = tracing::field::Empty,
+                    dynamo.router.prefill_cost_blocks = tracing::field::Empty,
+                    dynamo.router.request_cost_blocks = tracing::field::Empty,
+                    dynamo.router.preferred_taint_multiplier = tracing::field::Empty,
+                    dynamo.router.cost = tracing::field::Empty,
+                )
+            } else {
+                tracing::Span::none()
+            };
+            traced += usize::from(!candidate_span.is_disabled());
+            let _candidate_entered = candidate_span.enter();
+            *cost = if candidate_span.is_disabled() {
+                self.score_worker::<false>(context, candidate, &candidate_span)?
+            } else {
+                self.score_worker::<true>(context, candidate, &candidate_span)?
+            };
+        }
+        score_span.record("dynamo.router.candidates_traced", traced);
         Ok(())
     }
 }

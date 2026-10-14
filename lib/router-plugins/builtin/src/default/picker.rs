@@ -84,6 +84,15 @@ impl WorkerPicker for DefaultPicker {
         context: &WorkerSelectionContext<'_>,
         input: WorkerInputView<'_>,
     ) -> Result<usize, WorkerSelectionPolicyError> {
+        let picker_span = if tracing::Span::current().is_disabled() {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!(
+                "kv_router.pick_worker",
+                dynamo.router.temperature = self.temperature
+            )
+        };
+        let _entered = picker_span.enter();
         let candidates = input.candidates();
         if candidates.is_empty() {
             return Err(WorkerSelectionPolicyError::failed("no eligible worker"));

@@ -68,6 +68,7 @@ pub struct ClassQueueStats {
 }
 
 struct QueuedRequest {
+    trace_span: tracing::Span,
     request: SchedulingRequest,
     attempt_tx: Option<oneshot::Sender<AttemptId>>,
     lifecycle_transfer: Option<Arc<AdmissionLifecycleTransfer>>,
@@ -142,6 +143,7 @@ fn target_cached_prefix_blocks(request: &SchedulingRequest, target: WorkerWithDp
 #[allow(clippy::large_enum_variant)]
 enum AdmissionCommand {
     Enqueue {
+        trace_span: tracing::Span,
         request: SchedulingRequest,
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
         block_hashes: Option<Vec<LocalBlockHash>>,
@@ -150,6 +152,7 @@ enum AdmissionCommand {
         ack_tx: oneshot::Sender<Option<Box<RequestLifecycleLease>>>,
     },
     SelectWithoutAdmission {
+        trace_span: tracing::Span,
         request: SchedulingRequest,
         resp_tx: oneshot::Sender<Result<AdvisorySchedulingResponse, KvSchedulerError>>,
     },
@@ -779,6 +782,7 @@ impl<
 
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AdmissionCommand::Enqueue {
+            trace_span: tracing::Span::current(),
             request,
             attempt_tx,
             block_hashes: self.prepare_block_hashes_for_refresh(block_hashes),
@@ -848,6 +852,7 @@ impl<
         queue_metadata.due_at = Some(due_at);
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AdmissionCommand::Enqueue {
+            trace_span: tracing::Span::current(),
             request,
             attempt_tx: None,
             block_hashes: None,
@@ -989,7 +994,11 @@ impl<
         request.eligibility().validate_pinned_worker_allowed()?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        let command = AdmissionCommand::SelectWithoutAdmission { request, resp_tx };
+        let command = AdmissionCommand::SelectWithoutAdmission {
+            trace_span: tracing::Span::current(),
+            request,
+            resp_tx,
+        };
         if self.admission_tx.send(command).await.is_err() {
             return Err(KvSchedulerError::SubscriberShutdown);
         }
@@ -1113,6 +1122,7 @@ impl<
             }
             match command {
                 AdmissionCommand::Enqueue {
+                    trace_span,
                     request,
                     attempt_tx,
                     block_hashes,
@@ -1123,13 +1133,16 @@ impl<
                     let lifecycle_transfer = lease
                         .as_ref()
                         .and_then(|lease| lease.transfer.as_ref().map(Arc::clone));
-                    let enqueue_ready = self.handle_enqueue(
-                        request,
-                        attempt_tx,
-                        lifecycle_transfer,
-                        block_hashes,
-                        queue_metadata,
-                    );
+                    // Enter only around synchronous admission, never across an await.
+                    let enqueue_ready = trace_span.in_scope(|| {
+                        self.handle_enqueue(
+                            request,
+                            attempt_tx,
+                            lifecycle_transfer,
+                            block_hashes,
+                            queue_metadata,
+                        )
+                    });
                     let cleanup_ready = drain_cleanup && self.drain_cleanup();
                     if cleanup_ready {
                         self.handle_update().await;
@@ -1138,8 +1151,13 @@ impl<
                     }
                     let _ = ack_tx.send(lease);
                 }
-                AdmissionCommand::SelectWithoutAdmission { request, resp_tx } => {
-                    let result = self.select_without_admission_inner(request, Instant::now());
+                AdmissionCommand::SelectWithoutAdmission {
+                    trace_span,
+                    request,
+                    resp_tx,
+                } => {
+                    let result = trace_span
+                        .in_scope(|| self.select_without_admission_inner(request, Instant::now()));
                     if drain_cleanup && self.drain_cleanup() {
                         self.handle_update().await;
                     }
@@ -1243,6 +1261,7 @@ impl<
             .pinned_worker
             .map_or(WorkerPlacement::Any, WorkerPlacement::Exact);
         let queued = QueuedRequest {
+            trace_span: tracing::Span::current(),
             request,
             attempt_tx,
             lifecycle_transfer: lifecycle_transfer.clone(),
@@ -1584,12 +1603,14 @@ impl<
                 policy_class = class.name,
                 "scheduling request from pending queue"
             );
-            self.admit_one(
-                queued.request,
-                queued.attempt_tx,
-                queued.lifecycle_transfer,
-                admit_now,
-            );
+            queued.trace_span.in_scope(|| {
+                self.admit_one(
+                    queued.request,
+                    queued.attempt_tx,
+                    queued.lifecycle_transfer,
+                    admit_now,
+                )
+            });
         }
     }
 
@@ -2118,6 +2139,71 @@ mod tests {
             _: &str,
             _: crate::sequences::LocalWorkerLoad,
         ) {
+        }
+    }
+
+    struct ParentRecordingSelector(Arc<StdMutex<Vec<Option<tracing::Id>>>>);
+
+    impl WorkerSelector<SimpleWorkerConfig> for ParentRecordingSelector {
+        fn required_worker_inputs(&self) -> WorkerInputs {
+            <DefaultWorkerSelector as WorkerSelector<SimpleWorkerConfig>>::required_worker_inputs(
+                &DefaultWorkerSelector::new(None, "test"),
+            )
+        }
+
+        fn select_worker(
+            &self,
+            input: WorkerSelectionInput<'_, SimpleWorkerConfig>,
+        ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+            self.0.lock().unwrap().push(tracing::Span::current().id());
+            DefaultWorkerSelector::new(None, "test").select_worker(input)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selection_keeps_request_span_through_direct_queued_and_advisory_paths() {
+        use tracing::Instrument;
+        let subscriber = tracing_subscriber::registry();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        for threshold in [None, Some(0.0)] {
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let (queue, slots) = make_queue_with_custom_selector(
+                1,
+                16,
+                64,
+                threshold,
+                ParentRecordingSelector(Arc::clone(&seen)),
+            );
+            let active_span = tracing::info_span!("active_request");
+            let queued_span = tracing::info_span!("queued_request");
+            let advisory_span = tracing::info_span!("advisory_request");
+            let (active, active_rx) = make_request("trace-active", 64);
+            queue.enqueue(active).instrument(active_span.clone()).await;
+            active_rx.await.unwrap().unwrap();
+            let (queued, queued_rx) = make_request("trace-queued", 64);
+            queue.enqueue(queued).instrument(queued_span.clone()).await;
+            if threshold.is_some() {
+                assert_eq!(queue.pending_count(), 1);
+                assert_eq!(seen.lock().unwrap().len(), 1);
+                slots
+                    .free(&"trace-active".to_owned(), Instant::now())
+                    .unwrap();
+                // A capacity update has no request context of its own.
+                queue.update().await;
+            }
+            queued_rx.await.unwrap().unwrap();
+            let (probe, _rx) = make_request("trace-advisory", 64);
+            queue
+                .select_without_admission(probe)
+                .instrument(advisory_span.clone())
+                .await
+                .unwrap();
+            let (untraced, _rx) = make_request("untraced", 64);
+            queue.select_without_admission(untraced).await.unwrap();
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![active_span.id(), queued_span.id(), advisory_span.id(), None]
+            );
         }
     }
 
@@ -3004,6 +3090,7 @@ policy_classes:
         queue
             .admission_tx
             .send(AdmissionCommand::Enqueue {
+                trace_span: tracing::Span::current(),
                 request,
                 attempt_tx: None,
                 block_hashes: Some(vec![LocalBlockHash(42)]),
@@ -3482,7 +3569,11 @@ policy_classes:
             permits
                 .next()
                 .unwrap()
-                .send(AdmissionCommand::SelectWithoutAdmission { request, resp_tx });
+                .send(AdmissionCommand::SelectWithoutAdmission {
+                    trace_span: tracing::Span::current(),
+                    request,
+                    resp_tx,
+                });
             responses.push(resp_rx);
             queue.capacity_changed(Some(booking.worker));
         }
@@ -4515,6 +4606,8 @@ policy_classes:
                 pending_count: 2,
                 pending_isl_tokens: 128,
                 pending_cached_tokens: 0,
+                received_total: 4,
+                rejected_due_time_passed_total: 0,
             })
         );
     }
@@ -4546,7 +4639,7 @@ policy_classes:
         // 50 uncached tokens per request are charged. Under raw-ISL
         // accounting the second enqueue would already be rejected.
         let half_overlap = OverlapSignals {
-            effective_cached_tokens: HashMap::from([(WorkerWithDpRank::new(0, 0), 50)]),
+            effective_cached_tokens: [(WorkerWithDpRank::new(0, 0), 50)].into_iter().collect(),
             ..OverlapSignals::default()
         };
         let (mut first, _first_rx) = make_request("first", 100);
@@ -4579,6 +4672,8 @@ policy_classes:
                 pending_count: 2,
                 pending_isl_tokens: 200,
                 pending_cached_tokens: 100,
+                received_total: 4,
+                rejected_due_time_passed_total: 0,
             })
         );
     }

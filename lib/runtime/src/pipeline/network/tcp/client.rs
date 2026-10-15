@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
@@ -150,12 +151,14 @@ impl TcpClient {
         let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
 
         let reader_span = tracing::Span::current();
+        let peer_cancelled = Arc::new(AtomicBool::new(false));
         let reader_task = tokio::spawn(
-            handle_reader(
+            handle_reader_with_peer_cancellation(
                 framed_reader,
                 context.clone(),
                 alive_tx,
                 cancellation_counter,
+                peer_cancelled.clone(),
             )
             .instrument(reader_span),
         );
@@ -187,11 +190,13 @@ impl TcpClient {
 
         // forwards the bytes send from this stream to the transport layer; hold the alive_rx half of the oneshot channel
         let writer_context = context.clone();
-        let writer_task = tokio::spawn(handle_writer(
+        let transport_failed = Arc::new(AtomicBool::new(false));
+        let writer_task = tokio::spawn(handle_writer_with_failure_state(
             framed_writer,
             bytes_rx,
             alive_rx,
             writer_context,
+            transport_failed.clone(),
         ));
 
         let subject = info.subject.clone();
@@ -215,6 +220,8 @@ impl TcpClient {
         let stream_sender = StreamSender {
             tx: bytes_tx,
             prologue,
+            peer_cancelled,
+            transport_failed,
         };
 
         Ok(stream_sender)
@@ -593,11 +600,29 @@ async fn wait_for_server_shutdown(
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_reader(
     framed_reader: FramedRead<BoxRead, TwoPartCodec>,
     context: Arc<dyn AsyncEngineContext>,
     alive_tx: tokio::sync::oneshot::Sender<()>,
     cancellation_counter: Option<IntCounter>,
+) -> FramedRead<BoxRead, TwoPartCodec> {
+    handle_reader_with_peer_cancellation(
+        framed_reader,
+        context,
+        alive_tx,
+        cancellation_counter,
+        Default::default(),
+    )
+    .await
+}
+
+async fn handle_reader_with_peer_cancellation(
+    framed_reader: FramedRead<BoxRead, TwoPartCodec>,
+    context: Arc<dyn AsyncEngineContext>,
+    alive_tx: tokio::sync::oneshot::Sender<()>,
+    cancellation_counter: Option<IntCounter>,
+    peer_cancelled: Arc<AtomicBool>,
 ) -> FramedRead<BoxRead, TwoPartCodec> {
     let mut framed_reader = framed_reader;
     let mut alive_tx = alive_tx;
@@ -617,6 +642,7 @@ async fn handle_reader(
                                             err = ?e,
                                             "invalid control message, closing connection"
                                         );
+                                        peer_cancelled.store(false, Ordering::Release);
                                         cancellation_seen = true;
                                         context.kill();
                                         break;
@@ -638,12 +664,14 @@ async fn handle_reader(
                                     ControlMessage::Kill => {
                                         cancellation_seen = true;
                                         record_upstream_cancellation(context.as_ref(), "kill");
+                                        peer_cancelled.store(true, Ordering::Release);
                                         context.kill();
                                     }
                                     ControlMessage::Sentinel => {
                                         tracing::warn!(
                                             "unexpected sentinel on client reader, closing connection"
                                         );
+                                        peer_cancelled.store(false, Ordering::Release);
                                         cancellation_seen = true;
                                         context.kill();
                                         break;
@@ -654,6 +682,7 @@ async fn handle_reader(
                                 tracing::warn!(
                                     "unexpected non-control message on client reader, closing connection"
                                 );
+                                peer_cancelled.store(false, Ordering::Release);
                                 cancellation_seen = true;
                                 context.kill();
                                 break;
@@ -664,6 +693,7 @@ async fn handle_reader(
                         // Kill the engine context so the producer stops
                         // generating responses that can no longer be delivered.
                         tracing::warn!(err = ?e, "tcp stream read error, closing connection");
+                        peer_cancelled.store(false, Ordering::Release);
                         cancellation_seen = true;
                         context.kill();
                         break;
@@ -685,11 +715,29 @@ async fn handle_reader(
     framed_reader
 }
 
+#[cfg(test)]
 async fn handle_writer(
+    framed_writer: FramedWrite<BoxWrite, TwoPartCodec>,
+    bytes_rx: tokio::sync::mpsc::Receiver<TwoPartMessage>,
+    alive_rx: tokio::sync::oneshot::Receiver<()>,
+    context: Arc<dyn AsyncEngineContext>,
+) -> Result<FramedWrite<BoxWrite, TwoPartCodec>> {
+    handle_writer_with_failure_state(
+        framed_writer,
+        bytes_rx,
+        alive_rx,
+        context,
+        Default::default(),
+    )
+    .await
+}
+
+async fn handle_writer_with_failure_state(
     mut framed_writer: FramedWrite<BoxWrite, TwoPartCodec>,
     mut bytes_rx: tokio::sync::mpsc::Receiver<TwoPartMessage>,
     alive_rx: tokio::sync::oneshot::Receiver<()>,
     context: Arc<dyn AsyncEngineContext>,
+    transport_failed: Arc<AtomicBool>,
 ) -> Result<FramedWrite<BoxWrite, TwoPartCodec>> {
     // Keep one cancellation future per stream. Recreating these futures for every queued
     // frame repeatedly clones the context's watch receivers and churns Notify state.
@@ -728,6 +776,7 @@ async fn handle_writer(
         };
 
         if let Err(e) = framed_writer.send(msg).await {
+            transport_failed.store(true, Ordering::Release);
             tracing::trace!(
                 "failed to send message to network; possible disconnect: {:?}",
                 e
@@ -958,6 +1007,32 @@ mod tests {
 
         let sentinel = recv_msg(&mut reader).await;
         assert_sentinel_message(sentinel);
+    }
+
+    /// 写故障状态必须在发送通道关闭前可见，避免被上游取消覆盖。
+    #[tokio::test]
+    async fn test_writer_failure_is_retained_for_final_marker_classification() {
+        let (writer, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let framed_writer = FramedWrite::new(Box::new(writer) as BoxWrite, TwoPartCodec::default());
+        let (bytes_tx, bytes_rx) = mpsc::channel(1);
+        let (_alive_tx, alive_rx) = oneshot::channel();
+        let controller = Arc::new(crate::pipeline::context::Controller::default());
+        bytes_tx
+            .send(TwoPartMessage::from_data("response".into()))
+            .await
+            .unwrap();
+        let transport_failed = Arc::new(AtomicBool::new(false));
+        handle_writer_with_failure_state(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            transport_failed.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(transport_failed.load(Ordering::Acquire));
     }
 
     /// Test that handle_writer sends sentinel on normal channel closure
@@ -1489,10 +1564,19 @@ mod tests {
             controller,
         } = reader_harness().await;
 
+        let peer_cancelled = Arc::new(AtomicBool::new(false));
+        let reader_peer_cancelled = peer_cancelled.clone();
         // Spawn the reader task
         let controller_clone = controller.clone();
         let reader_handle = tokio::spawn(async move {
-            handle_reader(framed_reader, controller_clone, alive_tx, None).await
+            handle_reader_with_peer_cancellation(
+                framed_reader,
+                controller_clone,
+                alive_tx,
+                None,
+                reader_peer_cancelled,
+            )
+            .await
         });
 
         // Send Kill control message from server
@@ -1512,6 +1596,42 @@ mod tests {
             controller.is_killed(),
             "Controller should be killed after receiving Kill message"
         );
+        assert!(peer_cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_control_does_not_count_as_peer_cancellation() {
+        let ReaderHarness {
+            mut framed_server,
+            framed_reader,
+            alive_tx,
+            alive_rx: _alive_rx,
+            controller,
+        } = reader_harness().await;
+        let peer_cancelled = Arc::new(AtomicBool::new(false));
+        let reader_peer_cancelled = peer_cancelled.clone();
+        let reader_controller = controller.clone();
+        let reader = tokio::spawn(async move {
+            handle_reader_with_peer_cancellation(
+                framed_reader,
+                reader_controller,
+                alive_tx,
+                None,
+                reader_peer_cancelled,
+            )
+            .await
+        });
+        framed_server
+            .send(control_message(&ControlMessage::Kill))
+            .await
+            .unwrap();
+        framed_server
+            .send(TwoPartMessage::from_header("invalid control".into()))
+            .await
+            .unwrap();
+        reader.await.unwrap();
+        assert!(controller.is_killed());
+        assert!(!peer_cancelled.load(Ordering::Acquire));
     }
 
     /// Test that handle_reader exits when alive channel is closed

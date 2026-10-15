@@ -1033,6 +1033,8 @@ async fn tcp_listener(
                 // Request streams don't carry a downstream-prologue today; the
                 // upstream may begin sending immediately.
                 prologue: None,
+                peer_cancelled: Default::default(),
+                transport_failed: Default::default(),
             }))
             .is_err()
         {

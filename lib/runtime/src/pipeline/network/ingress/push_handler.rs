@@ -166,6 +166,10 @@ trait ResponsePublisher {
     async fn finish(&mut self) -> anyhow::Result<()>;
     async fn abort(&mut self) -> anyhow::Result<()>;
 
+    fn peer_cancelled(&self) -> bool {
+        false
+    }
+
     fn reset_on_stop(&self) -> bool {
         false
     }
@@ -213,6 +217,14 @@ impl ResponsePublisher for quic_response::QuicResponseSender {
 }
 
 impl ResponsePublisher for StreamSender {
+    fn peer_cancelled(&self) -> bool {
+        self.peer_cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .transport_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     async fn send(&self, payload: Bytes) -> anyhow::Result<()> {
         StreamSender::send(self, payload).await
     }
@@ -368,17 +380,9 @@ where
                 m.response_bytes.inc_by(resp_bytes.len() as u64);
             }
             if (publisher.send(resp_bytes).await).is_err() {
-                // `is_stopped()` is `state != Live`, so it is also true after
-                // `kill()` — which the response-stream reader does on a TCP read
-                // error. Excluding killed narrows this to `state == Stopped` so
-                // real connection failures stay counted. `&&` reads `is_killed()`
-                // last, so a Stopped -> Killed upgrade between the two reads
-                // falls to the error path.
-                //
-                // Reachable only with a peer-sent `Stop`: the local
-                // `stop_generating()` above clears `send_complete_final` and
-                // breaks first. That invariant is load-bearing.
-                if context.is_stopped() && !context.is_killed() {
+                // Stop 或本条响应连接明确收到的 Kill 可以解释结束标记发送失败。
+                // 仅凭 context.is_killed() 不能判断取消来源；读错误也会 kill。
+                if (context.is_stopped() && !context.is_killed()) || publisher.peer_cancelled() {
                     // The peer asked us to stop, so a failed marker write is
                     // attributable to that teardown, not to a fault here. Unlike
                     // the per-frame branch, this also skips the counter.
@@ -387,9 +391,7 @@ where
                         context.id()
                     );
                 } else {
-                    // Still attached, or killed (hard cancel, protocol violation,
-                    // connection error): the client sees a stream with no
-                    // end-of-stream marker, so this stays a counted error.
+                    // 未收到取消信号的硬终止、协议错误和连接故障仍计为错误。
                     tracing::error!(
                         "Failed to publish complete final for stream {}",
                         context.id()
@@ -1357,6 +1359,9 @@ mod tests {
         /// Frontend sent `ControlMessage::Kill`; the control reader called
         /// `context.kill()`.
         Kill,
+        /// 已收到上游 Kill，结束标记写失败属于取消后的清理。
+        PeerKill,
+        PeerKillWithWriteError,
         /// The response-stream reader hit a TCP read error and called
         /// `context.kill()` (`tcp/client.rs`, "tcp stream read error").
         /// Indistinguishable from `Kill` at the context level, which is
@@ -1384,7 +1389,14 @@ mod tests {
         // Capacity covers every content frame, so a send only fails once the
         // receiver is gone — never merely because the channel is full.
         let (tx, mut rx) = tokio::sync::mpsc::channel(content_frames + 8);
-        let publisher = StreamSender { tx, prologue: None };
+        let peer_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publisher = StreamSender {
+            tx,
+            prologue: None,
+            peer_cancelled: peer_cancelled.clone(),
+            transport_failed: transport_failed.clone(),
+        };
 
         let ctx = Context::new(serde_json::json!({}));
         let engine_ctx = ctx.context();
@@ -1431,6 +1443,15 @@ mod tests {
         match teardown {
             Teardown::Stop => engine_ctx.stop(),
             Teardown::Kill | Teardown::ConnectionReadError => engine_ctx.kill(),
+            Teardown::PeerKill => {
+                peer_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                engine_ctx.kill();
+            }
+            Teardown::PeerKillWithWriteError => {
+                peer_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                transport_failed.store(true, std::sync::atomic::Ordering::Release);
+                engine_ctx.kill();
+            }
             Teardown::TransportOnly => {}
         }
         drop(rx);
@@ -1479,6 +1500,19 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_publish_final_after_peer_kill_is_not_an_error() {
+        let (publish_final, publish_response) = run_teardown_race(3, Teardown::PeerKill).await;
+        assert_eq!(publish_final, 0);
+        assert_eq!(publish_response, 0);
+    }
+
+    #[tokio::test]
+    async fn test_publish_final_write_failure_takes_precedence_over_peer_kill() {
+        let (publish_final, _) = run_teardown_race(3, Teardown::PeerKillWithWriteError).await;
+        assert_eq!(publish_final, 1);
+    }
+
     /// The concrete regression: `tcp/client.rs` calls `context.kill()` on a TCP
     /// read error ("tcp stream read error, closing connection"). That path must
     /// remain visible in `dynamo_component_errors_total`.
@@ -1516,7 +1550,12 @@ mod tests {
 
         let content_frames = 3;
         let (tx, mut rx) = tokio::sync::mpsc::channel(content_frames + 8);
-        let publisher = StreamSender { tx, prologue: None };
+        let publisher = StreamSender {
+            tx,
+            prologue: None,
+            peer_cancelled: Default::default(),
+            transport_failed: Default::default(),
+        };
 
         let ctx = Context::new(serde_json::json!({}));
         let content: Vec<TestResponse> = (0..content_frames)
@@ -1579,7 +1618,12 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         drop(rx);
-        let publisher = StreamSender { tx, prologue: None };
+        let publisher = StreamSender {
+            tx,
+            prologue: None,
+            peer_cancelled: Default::default(),
+            transport_failed: Default::default(),
+        };
 
         let ctx = Context::new(serde_json::json!({}));
         let response_stream: ManyOut<TestResponse> =

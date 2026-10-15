@@ -626,6 +626,9 @@ mod registered_stream_tests {
 pub struct StreamSender {
     tx: tokio::sync::mpsc::Sender<TwoPartMessage>,
     prologue: Option<ResponseStreamPrologue>,
+    // 仅表示本条响应连接收到上游 Kill，不表示底层连接故障。
+    peer_cancelled: Arc<std::sync::atomic::AtomicBool>,
+    transport_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StreamSender {

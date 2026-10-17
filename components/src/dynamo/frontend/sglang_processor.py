@@ -61,12 +61,13 @@ logger = logging.getLogger(__name__)
 
 
 # Map SGLang/backend error strings so the reason reaches the client instead of
-# an opaque 500. A classified backend error is emitted as a tagged SSE error
+# an opaque 500. Known scheduler input-limit errors use InvalidArgument so
+# the native bridge preserves their public message even after HTTP headers
+# are committed. Other classified errors use the legacy tagged SSE error
 # frame whose comment carries {"message", "code"} JSON: the HTTP service's
 # pre-commit error peek (DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS) json-parses that
 # comment to return the typed status before committing the stream, and
-# forwards a 4xx message as-is; without the peek, streaming still surfaces the
-# comment as the SSE error text. Remove this when GitHub issue #14354 (DEP:
+# forwards a 4xx message as-is. Remove this when GitHub issue #14354 (DEP:
 # unified semantic error propagation) lands and covers the SGLang disagg path.
 _SGL_QUEUE_OVERFLOW_RE = re.compile(
     r"queue[^.\n]*limit reached|policy class.*queue",
@@ -79,10 +80,16 @@ _SGL_OVERCONTEXT_RE = re.compile(
     r"|context length",
     re.IGNORECASE,
 )
+_SGL_INPUT_LENGTH_RE = re.compile(
+    r"(?:InvalidRequest: |BackendInvalidArgument: )?"
+    r"(?P<message>Input length \([0-9]+ tokens\) exceeds "
+    r"the maximum allowed length \([0-9]+ tokens\)\. "
+    r"Use a shorter input or enable --allow-auto-truncate\.)"
+)
 
 
-def _classify_sglang_error(message: str) -> HttpError | None:
-    """Map a backend or routed-engine error message to a client-facing HttpError.
+def _classify_sglang_error(message: str) -> InvalidArgument | HttpError | None:
+    """Map a backend or routed-engine message to a client-facing error.
 
     Returns None when the message is none of the recognized shapes, so the
     caller keeps its existing fallback (an SSE error envelope or Unknown).
@@ -92,6 +99,11 @@ def _classify_sglang_error(message: str) -> HttpError | None:
     # alone is not evidence of a genuinely invalid argument.
     if _SGL_QUEUE_OVERFLOW_RE.search(message):
         return HttpError(429, message)
+    # SGLang's scheduler can reject against its KV capacity below the model's
+    # context limit. Only expose this known validation message, not wrappers
+    # or arbitrary diagnostics containing similar text.
+    if match := _SGL_INPUT_LENGTH_RE.fullmatch(message):
+        return InvalidArgument(match.group("message"))
     if _SGL_OVERCONTEXT_RE.search(message):
         return HttpError(400, message)
     err = backend_invalid_argument_to_http_error(RuntimeError(message))
@@ -1007,6 +1019,8 @@ class SglangProcessor:
                         message,
                     )
                     err = _classify_sglang_error(message)
+                    if isinstance(err, InvalidArgument):
+                        raise err
                     if err is not None:
                         yield _classified_error_envelope(err)
                         break
@@ -1092,6 +1106,8 @@ class SglangProcessor:
             raise
         except Exception as e:
             err = _classify_sglang_error(str(e))
+            if isinstance(err, InvalidArgument):
+                raise err from e
             if err is not None:
                 logger.warning(
                     "Backend rejected request %s with %d: %s",

@@ -4350,6 +4350,92 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
 class TestClassifySglangError:
     """Classify backend/routed-engine error strings to client-facing HTTP statuses."""
 
+    @pytest.mark.parametrize(
+        "prefix", ["", "InvalidRequest: ", "BackendInvalidArgument: "]
+    )
+    def test_scheduler_input_limit_is_typed_invalid_argument(self, prefix):
+        message = (
+            "Input length (4097 tokens) exceeds the maximum allowed length "
+            "(4096 tokens). Use a shorter input or enable --allow-auto-truncate."
+        )
+        err = _classify_sglang_error(prefix + message)
+        assert isinstance(err, InvalidArgument)
+        assert str(err) == message
+
+    @pytest.mark.parametrize(
+        "stage,after_output",
+        [
+            ("initial", False),
+            ("event", False),
+            ("exception", False),
+            ("event", True),
+            ("exception", True),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "prefix", ["", "InvalidRequest: ", "BackendInvalidArgument: "]
+    )
+    def test_scheduler_input_limit_survives_routed_engine(
+        self, stage, after_output, prefix
+    ):
+        message = (
+            "Input length (4097 tokens) exceeds the maximum allowed length "
+            "(4096 tokens). Use a shorter input or enable --allow-auto-truncate."
+        )
+
+        class RejectingEngine:
+            async def generate(self, request, **kwargs):
+                if stage == "initial":
+                    raise RuntimeError(prefix + message)
+                return self.responses()
+
+            async def responses(self):
+                if after_output:
+                    yield FakeRoutedItem({"token_ids": [65]})
+                if stage == "exception":
+                    raise RuntimeError(prefix + message)
+                yield FakeRoutedItem(None, is_error=True, comments=[prefix + message])
+                pytest.fail("The stream must stop after the input-limit error")
+
+        processor = object.__new__(SglangProcessor)
+        processor.routed_engine = RejectingEngine()
+        processor.stream_interval = 1
+        processor.debug_perf = False
+
+        post = types.SimpleNamespace(
+            locally_finished=False,
+            has_pending_stop_text=False,
+            local_stop_reason=None,
+            process_output=lambda response: {
+                "index": 0,
+                "delta": {"content": "A"},
+                "finish_reason": None,
+            },
+        )
+
+        async def check():
+            stream = processor._generate_and_stream(
+                "test-input-limit", {"model": "test"}, {}, [], post
+            )
+            if after_output:
+                first = await anext(stream)
+                assert first["data"]["choices"][0]["delta"]["content"] == "A"
+            with pytest.raises(InvalidArgument) as error:
+                await anext(stream)
+            assert str(error.value) == message
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+
+        asyncio.run(check())
+
+    @pytest.mark.parametrize("suffix", [" private path: /srv/worker.py", "\ntraceback"])
+    def test_scheduler_input_limit_does_not_expose_trailing_diagnostics(self, suffix):
+        message = (
+            "InvalidRequest: Input length (4097 tokens) exceeds the maximum allowed "
+            "length (4096 tokens). Use a shorter input or enable --allow-auto-truncate."
+        )
+        assert _classify_sglang_error(message + suffix) is None
+
     def test_over_context_message_is_400(self):
         err = _classify_sglang_error(
             "The input (5105302 tokens) is longer than the model's "

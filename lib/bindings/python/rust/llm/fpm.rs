@@ -58,8 +58,14 @@ impl FpmEventRelay {
     ///         (e.g., "tcp://127.0.0.1:20380").
     #[new]
     #[pyo3(signature = (endpoint, zmq_endpoint))]
-    fn new(endpoint: Endpoint, zmq_endpoint: String) -> PyResult<Self> {
-        let inner = llm_rs::fpm_publisher::FpmEventRelay::new(endpoint.inner.clone(), zmq_endpoint)
+    fn new(py: Python<'_>, endpoint: Endpoint, zmq_endpoint: String) -> PyResult<Self> {
+        let endpoint = endpoint.inner;
+        // Initialization blocks on the secondary runtime, whose callbacks may
+        // need the GIL. Release it so those callbacks can make progress.
+        let inner = py
+            .allow_threads(move || {
+                llm_rs::fpm_publisher::FpmEventRelay::new(endpoint, zmq_endpoint)
+            })
             .map_err(to_pyerr)?;
         Ok(Self { inner })
     }

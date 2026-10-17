@@ -260,8 +260,11 @@ jobs:
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
             # Use Git transport instead of copying a live .git directory: auto
             # maintenance can remove tmp_pack files while cp traverses it.
+            # A shallow clone follows the detached HEAD instead of stale branch
+            # tips that can trigger repeated promisor fetches in this mirror.
             git -C "$MIRROR" config uploadpack.allowFilter true
-            git clone --no-local --no-checkout --filter=blob:none "$MIRROR" "$GITHUB_WORKSPACE"
+            git clone --no-local --no-checkout --depth 1 --no-tags --filter=blob:none \
+              "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
             git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
             git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE

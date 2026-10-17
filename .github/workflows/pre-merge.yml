@@ -139,8 +139,10 @@ jobs:
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
             # Use Git transport instead of copying a live .git directory: auto
             # maintenance can remove tmp_pack files while cp traverses it.
+            # Follow the detached HEAD, avoiding stale shallow branch tips.
             git -C "$MIRROR" config uploadpack.allowFilter true
-            git clone --no-local --no-checkout --filter=blob:none "$MIRROR" "$GITHUB_WORKSPACE"
+            git clone --no-local --no-checkout --depth "$DEPTH" --no-tags --filter=blob:none \
+              "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
             git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
             git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE
@@ -213,7 +215,9 @@ jobs:
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
             # Use Git transport instead of copying a live .git directory: auto
             # maintenance can remove tmp_pack files while cp traverses it.
-            git clone --no-local --no-checkout "$MIRROR" "$GITHUB_WORKSPACE"
+            # Follow the detached HEAD, avoiding stale shallow branch tips.
+            git clone --no-local --no-checkout --depth 1 --no-tags \
+              "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
             git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
@@ -315,8 +319,10 @@ jobs:
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
             # Use Git transport instead of copying a live .git directory: auto
             # maintenance can remove tmp_pack files while cp traverses it.
+            # Follow the detached HEAD, avoiding stale shallow branch tips.
             git -C "$MIRROR" config uploadpack.allowFilter true
-            git clone --no-local --no-checkout --filter=blob:none "$MIRROR" "$GITHUB_WORKSPACE"
+            git clone --no-local --no-checkout --depth 1 --no-tags --filter=blob:none \
+              "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
             git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
             git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE

@@ -202,12 +202,11 @@ jobs:
       # Checkout: a shared partial-clone mirror under /cache/repos is reused
       # across runs — only the new commit's tiny delta is fetched each time, and
       # the work tree is cloned LOCALLY from that mirror (no 2nd github trip).
-      # No mirror yet → fresh partial clone (one-time, then cached). One job per
-      # ARC runner → no mirror lock. github is pulled through a domestic gh-proxy
-      # with the job-scoped GITHUB_TOKEN in the URL userinfo (gh-proxy forwards
-      # Basic auth upstream; the token is contents:read + expires when the job
-      # ends — low-leak, user-approved). cone omits docs/ benchmarks/ skills/.
-      - name: Checkout (cached shallow mirror + local copy)
+      # No mirror yet → fresh partial clone (one-time, then cached). Serialize
+      # cache access across refs and use Git transport to create each checkout.
+      # Fetch from github.com with the job-scoped, contents:read GITHUB_TOKEN.
+      # cone omits docs/ benchmarks/ skills/.
+      - name: Checkout (cached shallow mirror + independent clone)
         shell: bash
         env:
           GH_PROXY: ${{ env.GH_PROXY }}
@@ -237,6 +236,10 @@ jobs:
 
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
             mkdir -p "$(dirname "$MIRROR")"
+            # Different refs share this cache, so protect fetch and checkout too.
+            MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}.gitlock"
+            exec 9>"$MLOCK"
+            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
             # Re-seed when the mirror (or this checkout version's marker) is absent.
             # A marker (not partialclonefilter config) is the gate: older checkout
             # versions removed origin on re-add, dropping that config and leaving a
@@ -255,10 +258,14 @@ jobs:
             git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
             git -C "$MIRROR" sparse-checkout set $SPARSE
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
-            # work tree = a local copy of the mirror's checked-out tree. .git is
-            # kept so later steps can `git rev-parse`; .dockerignore drops it from
-            # the docker build context.
-            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+            # Use Git transport instead of copying a live .git directory: auto
+            # maintenance can remove tmp_pack files while cp traverses it.
+            git -C "$MIRROR" config uploadpack.allowFilter true
+            git clone --no-local --no-checkout --filter=blob:none "$MIRROR" "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
+            git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
+            git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE
+            git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
             echo "no /cache/repos volume — direct shallow clone via gh-proxy"
             cd "$GITHUB_WORKSPACE"

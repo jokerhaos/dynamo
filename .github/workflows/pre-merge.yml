@@ -126,7 +126,7 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            if command -v flock >/dev/null 2>&1; then flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }; fi
+            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
             MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
@@ -137,7 +137,14 @@ jobs:
             git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
             git -C "$MIRROR" sparse-checkout set $SPARSE
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
-            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+            # Use Git transport instead of copying a live .git directory: auto
+            # maintenance can remove tmp_pack files while cp traverses it.
+            git -C "$MIRROR" config uploadpack.allowFilter true
+            git clone --no-local --no-checkout --filter=blob:none "$MIRROR" "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
+            git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
+            git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE
+            git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
             echo "::notice::no /cache/repos volume — direct partial clone"
             git clone --no-tags --depth "$DEPTH" --filter=blob:none --no-checkout "$url" .
@@ -195,7 +202,7 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            if command -v flock >/dev/null 2>&1; then flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }; fi
+            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
             MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
@@ -204,7 +211,11 @@ jobs:
             fi
             git -C "$MIRROR" remote set-url origin "$url"
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
-            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+            # Use Git transport instead of copying a live .git directory: auto
+            # maintenance can remove tmp_pack files while cp traverses it.
+            git clone --no-local --no-checkout "$MIRROR" "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
+            git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
             echo "::notice::no /cache/repos volume — direct shallow clone"
             git clone --no-tags --depth 1 "$url" .
@@ -219,6 +230,8 @@ jobs:
           python3 -m venv "$HOME/venv"
           "$HOME/venv/bin/pip" install --quiet pre-commit
           echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+      - name: Test independent cached checkouts
+        run: '"$HOME/venv/bin/python" scripts/test_ci_checkout.py -v'
       - name: Run pre-commit (all files)
         # Bypass pre-commit/action: its bundled actions/cache round-trips
         # the 78MB hook-env archive through the painfully slow GitHub cache
@@ -289,7 +302,7 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            if command -v flock >/dev/null 2>&1; then flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }; fi
+            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
             MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
@@ -300,7 +313,14 @@ jobs:
             git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
             git -C "$MIRROR" sparse-checkout set $SPARSE
             retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
-            cp -aT "$MIRROR/." "$GITHUB_WORKSPACE/"
+            # Use Git transport instead of copying a live .git directory: auto
+            # maintenance can remove tmp_pack files while cp traverses it.
+            git -C "$MIRROR" config uploadpack.allowFilter true
+            git clone --no-local --no-checkout --filter=blob:none "$MIRROR" "$GITHUB_WORKSPACE"
+            git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
+            git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
+            git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE
+            git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
             echo "::notice::no /cache/repos volume — direct partial clone"
             git clone --no-tags --depth 1 --filter=blob:none --no-checkout "$url" .

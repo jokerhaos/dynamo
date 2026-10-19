@@ -13,6 +13,7 @@ use dynamo_runtime::logging::{DistributedTraceContext, otel_parent_context_from_
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 
+use crate::errors::InvalidArgument;
 use crate::to_pyerr;
 
 #[pyclass]
@@ -68,7 +69,10 @@ impl RoutedEngine {
         crate::future_into_py(
             py,
             async move {
-                let mut stream = inner.generate(request_context).await.map_err(to_pyerr)?;
+                let mut stream = inner
+                    .generate(request_context)
+                    .await
+                    .map_err(generate_error_to_pyerr)?;
                 let task_context = stream.context();
                 let (tx, rx) = tokio::sync::mpsc::channel::<RsAnnotated<PyObject>>(32);
 
@@ -106,6 +110,39 @@ impl RoutedEngine {
             .instrument(dispatch_span),
         )
     }
+}
+
+/// Convert a routed-engine generate failure into a Python exception,
+/// preserving a rejection the backend classified as the caller's fault.
+///
+/// The prefill path returns the backend's typed rejection in the error
+/// chain (see `PrefillError`, which carries it as its source). `to_pyerr`
+/// would flatten the chain to `Display` text, and the Python chat
+/// processors cannot tell that text from an internal fault: their generic
+/// handlers re-wrap it as an unknown error and the HTTP boundary answers a
+/// sanitized 500. Raising the typed `InvalidArgument` exception instead
+/// keeps the classification across the boundary — the processors re-raise
+/// it, and `map_python_exception` forwards the message as a 400. The
+/// backend's class is the same trust token that mechanism already applies
+/// to typed Python `ValueError`s.
+fn generate_error_to_pyerr(error: anyhow::Error) -> PyErr {
+    use dynamo_runtime::error::{DynamoError, ErrorClass};
+
+    for cause in error.chain() {
+        let Some(dynamo_error) = cause.downcast_ref::<DynamoError>() else {
+            continue;
+        };
+        if dynamo_error.class() != ErrorClass::InvalidRequest {
+            continue;
+        }
+        let message = dynamo_error
+            .public_message()
+            .unwrap_or_else(|| dynamo_error.message());
+        if !message.is_empty() {
+            return InvalidArgument::new_err(message.to_string());
+        }
+    }
+    to_pyerr(error)
 }
 
 fn dispatch_span(
@@ -153,6 +190,105 @@ mod tests {
             "x_request_id": "xr-1",
         }))
         .expect("DistributedTraceContext deserializes from trace_id + span_id")
+    }
+
+    /// The shape the prefill router returns for a backend-rejected request:
+    /// the backend's typed rejection wrapped as the source of
+    /// context-bearing errors whose `Display` text alone carries the class.
+    fn chained_rejection(
+        error_type: dynamo_runtime::error::ErrorType,
+        message: &str,
+    ) -> anyhow::Error {
+        let rejection = dynamo_runtime::error::DynamoError::builder()
+            .error_type(error_type)
+            .message(message.to_string())
+            .build();
+        anyhow::Error::new(rejection)
+            .context("Prefill router returned error in output: InvalidRequest")
+    }
+
+    #[test]
+    fn backend_rejections_cross_as_typed_invalid_argument() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            use dynamo_runtime::error::{BackendError, ErrorType};
+
+            let chained = chained_rejection(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                "Model does not accept image input; received unsupported content type 'image_url'.",
+            );
+
+            let pyerr = generate_error_to_pyerr(chained);
+
+            assert!(
+                pyerr.is_instance_of::<crate::errors::InvalidArgument>(py),
+                "a backend InvalidRequest rejection must cross as the typed exception"
+            );
+            let text = pyerr
+                .value(py)
+                .str()
+                .expect("typed rejection carries the backend message")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                text,
+                "Model does not accept image input; received unsupported content type 'image_url'."
+            );
+        });
+    }
+
+    #[test]
+    fn internal_errors_keep_the_flattened_display_text() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            use dynamo_runtime::error::{BackendError, ErrorType};
+
+            let chained =
+                chained_rejection(ErrorType::Backend(BackendError::Unknown), "engine exploded");
+
+            let pyerr = generate_error_to_pyerr(chained);
+
+            assert!(!pyerr.is_instance_of::<crate::errors::InvalidArgument>(py));
+            let text = pyerr
+                .value(py)
+                .str()
+                .expect("flattened error keeps its text")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                text.contains("Prefill router returned error in output"),
+                "got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn messageless_rejections_fall_back_to_the_flattened_text() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            use dynamo_runtime::error::{BackendError, ErrorType};
+
+            // A rejection with no message to forward must not invent a typed
+            // exception with an empty payload; it keeps the legacy behavior.
+            let rejection = dynamo_runtime::error::DynamoError::builder()
+                .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                .build();
+            let chained = anyhow::Error::new(rejection).context("prefill failed without a reason");
+
+            let pyerr = generate_error_to_pyerr(chained);
+
+            assert!(!pyerr.is_instance_of::<crate::errors::InvalidArgument>(py));
+            let text = pyerr
+                .value(py)
+                .str()
+                .expect("flattened error keeps its text")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                text.contains("prefill failed without a reason"),
+                "got: {text}"
+            );
+        });
     }
 
     fn with_otel_subscriber<T>(f: impl FnOnce() -> T) -> T {

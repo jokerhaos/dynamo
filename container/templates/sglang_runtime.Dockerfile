@@ -36,7 +36,7 @@ ARG CUDA_MAJOR
 # --force-reinstall: the fork-built base may already carry a (tracing-less)
 # mooncake wheel at this version, and "already satisfied" would leave it in
 # place. The tracing check at the end of this stage is the backstop.
-ARG MOONCAKE_CUDA13_VERSION=0.3.13.post2
+ARG MOONCAKE_CUDA13_VERSION=0.3.13.post3
 ARG MOONCAKE_FIND_LINKS=https://minio.0xtoken.cn/python-packages/simple/mooncake-transfer-engine-cuda13/index.html
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --break-system-packages --no-deps --no-index \

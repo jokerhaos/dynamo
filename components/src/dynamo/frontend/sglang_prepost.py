@@ -80,16 +80,16 @@ class SglangPreprocessResult:
 _GUIDED_BARE_JSON_RE = re.compile(r"\[\s*\{")
 
 _FORCE_REASONING_PATTERNS = (
-    # qwen3-family: <|im_start|>assistant\n<llm:think>\n
-    re.compile(r"<\|im_start\|>assistant\\n<llm:think>\\n"),
-    # GLM-4.5/5 and similar: <llm:think> followed by an opening <llm:think>
+    # qwen3-family: <|im_start|>assistant\n<think>\n
+    re.compile(r"<\|im_start\|>assistant\\n<think>\\n"),
+    # GLM-4.5/5 and similar: <|assistant|> followed by an opening <think>
     # within the generation-prompt block. The template often has Jinja
-    # expressions (including a '<llm:/think>' literal) between the two, so we
-    # match the opening tag literally -- '<llm:think>' never matches
-    # '<llm:/think>' because the '/' breaks the literal prefix.
-    re.compile(r"<\|assistant\|>[\s\S]{0,400}?<llm:think>"),
+    # expressions (including a '</think>' literal) between the two, so we
+    # match the opening tag literally -- '<think>' never matches
+    # '</think>' because the '/' breaks the literal prefix.
+    re.compile(r"<\|assistant\|>[\s\S]{0,400}?<think>"),
     # generic fallback for non-delimiter-style templates
-    re.compile(r"\bassistant\b[\s\S]{0,200}?<llm:think>"),
+    re.compile(r"\bassistant\b[\s\S]{0,200}?<think>"),
     # Hunyuan (Hy3/Hy4): the generation prompt emits the assistant header via
     # Jinja string concatenation -- ``'assistant' ~ hy_middle_token ~
     # think_begin_token`` -- where think_begin_token itself is

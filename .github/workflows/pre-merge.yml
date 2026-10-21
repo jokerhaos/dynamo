@@ -53,12 +53,16 @@ env:
   PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
   GH_PROXY: https://gh-proxy.com
   RS_PROXY: https://rsproxy.cn
-  # Sparse-checkout cone shared by pre-commit + the rust matrix (root files are
-  # always included in cone mode). Covers everything the hooks and CPU-only
-  # rust checks touch. changed-files sets its own (`.github` only — it only
-  # needs .github/filters.yaml + .github/actions/changed-files, and tj-actions
-  # gets file lists from the REST API / git diff, not the working tree).
-  SPARSE: "lib components deploy tests examples dev recipes .cargo scripts .github"
+  # The runner image ships a global git-lfs filter and this repo tracks real
+  # media under lib/llm/tests/data/media and recipes/*/perf/traces, so every
+  # full or lib/-cone checkout smudges each LFS pointer and git-lfs downloads
+  # the actual objects from github.com's LFS endpoints. git-lfs uses its own
+  # HTTP client — http.lowSpeedLimit/Time don't apply — so a stalled transfer
+  # hangs the checkout until the step timeout (three Pre Merge runs died this
+  # way, git-lfs left as an orphan mid-checkout). No job here needs the bytes
+  # (hooks and the rust checks treat those files as opaque binaries), so skip
+  # the smudge: checkouts write pointer stubs and never touch LFS endpoints.
+  GIT_LFS_SKIP_SMUDGE: '1'
   #
   # Why every checkout is INLINE here (not a reusable .github/actions/* composite
   # referenced as astro-web3/dynamo/.github/actions/...@main): that composite is
@@ -85,11 +89,22 @@ jobs:
     outputs:
       rust: ${{ steps.changes.outputs.rust }}
     steps:
-      - name: Checkout (cached partial-clone mirror, depth 2)
-        timeout-minutes: 10
+      - name: Checkout (shared full mirror, depth 2)
+        timeout-minutes: 15
         env:
           GH_TOKEN: ${{ github.token }}
-          MIRROR_KEY: changed-files
+          # Every job in this workflow shares ONE full-tree shallow mirror
+          # (the 'full' key): whichever job grabs the mirror lock first pays
+          # the run's single github.com fetch — a small delta pack, the
+          # mirror's existing objects negotiate as haves — and the other
+          # jobs, plus any re-run of a failed one, find HEAD already at
+          # this SHA and skip the network entirely. Full, never blob:none:
+          # a partial mirror would push the workspace clones below into
+          # on-demand per-blob fetches from github.com, the exact flaky-
+          # link death this mirror exists to avoid; cloning the full mirror
+          # carries every blob at local-disk speed instead. DEPTH 2: push
+          # events diff against the parent commit.
+          MIRROR_KEY: full
           DEPTH: '2'
           SPARSE: .github
         run: |
@@ -113,11 +128,21 @@ jobs:
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
-          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" --filter=blob:none "$url" "$MIRROR"; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            git -C "$MIRROR" fetch --filter=blob:none --depth "$DEPTH" --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
+            # Skip on HEAD, never `cat-file -e`: on this repo cat-file would
+            # lazy-fetch the object from github.com — a hidden network trip.
+            # HEAD sits at $GITHUB_SHA only after a previous fetch+warm of
+            # exactly this SHA, so re-runs and same-run sibling jobs skip.
+            [ "$(git -C "$MIRROR" rev-parse HEAD 2>/dev/null || true)" = "$GITHUB_SHA" ] && return 0
+            git -C "$MIRROR" fetch --depth "$DEPTH" --no-tags origin "$GITHUB_SHA"
           }
+          # Checkout split out of fetch_sha so a skipped fetch still ends
+          # with the mirror HEAD at the SHA: the workspace clone below
+          # follows the advertised HEAD, and a fetch-by-SHA leaves HEAD at
+          # the old tip. Retried like the fetch.
+          warm_sha(){ git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
             # Serialize runs sharing this mirror and self-heal stale
@@ -126,30 +151,40 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
-            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
+            flock -w 900 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v5"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
-              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
+              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
               retry seed || { echo "::error::mirror seed failed"; exit 1; }
               : > "$MARK"
             fi
             git -C "$MIRROR" remote set-url origin "$url"
-            git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
-            git -C "$MIRROR" sparse-checkout set $SPARSE
-            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
+            # Sibling jobs clone this mirror locklessly (the flock is
+            # released before their clone), so the mirror must never
+            # self-repack mid-read: a gc pruning packs would race those
+            # clones. Fetches only bring small delta packs, so leaving
+            # them unconsolidated is fine; bump the seed marker version to
+            # reset the mirror if it ever needs a compact.
+            git -C "$MIRROR" config gc.auto 0
+            retry fetch_sha || { echo "::error::mirror fetch failed"; exit 1; }
+            retry warm_sha || { echo "::error::mirror checkout failed"; exit 1; }
+            # Release the mirror lock before the workspace clone: it (and
+            # the checkout) only reads the mirror. Holding the flock through
+            # it serializes the sibling jobs of one run behind a pure-local
+            # copy for no benefit.
+            exec 9>&-
             # Use Git transport instead of copying a live .git directory: auto
             # maintenance can remove tmp_pack files while cp traverses it.
             # Follow the detached HEAD, avoiding stale shallow branch tips.
-            git -C "$MIRROR" config uploadpack.allowFilter true
-            git clone --no-local --no-checkout --depth "$DEPTH" --no-tags --filter=blob:none \
+            git clone --no-local --no-checkout --depth "$DEPTH" --no-tags \
               "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
             git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
             git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE
             git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
-            echo "::notice::no /cache/repos volume — direct partial clone"
-            git clone --no-tags --depth "$DEPTH" --filter=blob:none --no-checkout "$url" .
+            echo "::notice::no /cache/repos volume — direct shallow clone"
+            git clone --no-tags --depth "$DEPTH" --no-checkout "$url" .
             git sparse-checkout init --cone
             git sparse-checkout set $SPARSE
             git checkout -f "$GITHUB_SHA"
@@ -165,11 +200,19 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout (cached shallow mirror, full tree)
-        timeout-minutes: 10
+      - name: Checkout (shared full mirror, full tree)
+        timeout-minutes: 15
         env:
           GH_TOKEN: ${{ github.token }}
-          MIRROR_KEY: pre-commit
+          # Same 'full' mirror as changed-files (runs concurrently) and the
+          # rust job (runs after `needs: changed-files`): this job usually
+          # finds HEAD already at this SHA — fetched by whichever job won
+          # the mirror lock — and skips its own github.com fetch. Full
+          # tree, no sparse: pre-commit --all-files walks the whole tree
+          # (validate-skills → .agents/skills, the docs/fern/* scripts,
+          # default trailing-whitespace/EOF hooks).
+          MIRROR_KEY: full
+          DEPTH: '2'
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
@@ -185,17 +228,17 @@ jobs:
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
-          # Full shallow clone (one pack, no --filter: partial-clone would trigger
-          # hundreds of per-blob on-demand fetches across the whole tree and die on
-          # a flaky link). First run pays the full pack; later runs only fetch the
-          # delta by SHA. No sparse — pre-commit --all-files walks the whole tree
-          # (validate-skills → .agents/skills, the docs/fern/* scripts, default
-          # trailing-whitespace/EOF hooks).
-          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 "$url" "$MIRROR"; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            git -C "$MIRROR" fetch --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
+            # Skip on HEAD, never `cat-file -e` (it lazy-fetches the
+            # object from github.com): HEAD equals $GITHUB_SHA only after
+            # a previous fetch+warm of exactly this SHA, so a re-run or a
+            # sibling job of the same run skips the fetch.
+            [ "$(git -C "$MIRROR" rev-parse HEAD 2>/dev/null || true)" = "$GITHUB_SHA" ] && return 0
+            git -C "$MIRROR" fetch --depth "$DEPTH" --no-tags origin "$GITHUB_SHA"
           }
+          warm_sha(){ git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
             # Serialize runs sharing this mirror and self-heal stale
@@ -204,25 +247,40 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
-            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
+            flock -w 900 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v5"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
               retry seed || { echo "::error::mirror seed failed"; exit 1; }
               : > "$MARK"
             fi
             git -C "$MIRROR" remote set-url origin "$url"
-            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
+            # Sibling jobs clone this mirror locklessly (the flock is
+            # released before their clone), so the mirror must never
+            # self-repack mid-read: a gc pruning packs would race those
+            # clones. Fetches only bring small delta packs, so leaving
+            # them unconsolidated is fine; bump the seed marker version to
+            # reset the mirror if it ever needs a compact.
+            git -C "$MIRROR" config gc.auto 0
+            retry fetch_sha || { echo "::error::mirror fetch failed"; exit 1; }
+            # Runs even when the fetch was skipped so the mirror HEAD ends
+            # at the SHA the workspace clone follows.
+            retry warm_sha || { echo "::error::mirror checkout failed"; exit 1; }
+            # Release the mirror lock before the workspace clone: it (and
+            # the checkout) only reads the mirror. Holding the flock through
+            # it serializes the sibling jobs of one run behind a pure-local
+            # copy for no benefit.
+            exec 9>&-
             # Use Git transport instead of copying a live .git directory: auto
             # maintenance can remove tmp_pack files while cp traverses it.
             # Follow the detached HEAD, avoiding stale shallow branch tips.
-            git clone --no-local --no-checkout --depth 1 --no-tags \
+            git clone --no-local --no-checkout --depth "$DEPTH" --no-tags \
               "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
             git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
             echo "::notice::no /cache/repos volume — direct shallow clone"
-            git clone --no-tags --depth 1 "$url" .
+            git clone --no-tags --depth "$DEPTH" "$url" .
             git checkout -f "$GITHUB_SHA"
           fi
       - name: Install python3-venv (sudo; pod is ephemeral, no base-image pollution)
@@ -273,11 +331,18 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout (cached partial-clone mirror)
-        timeout-minutes: 10
+      - name: Checkout (shared full mirror, full tree)
+        timeout-minutes: 15
         env:
           GH_TOKEN: ${{ github.token }}
-          MIRROR_KEY: rust-${{ matrix.dir }}
+          # Same 'full' mirror as changed-files and pre-commit. `needs:
+          # changed-files` guarantees that job already fetched the run's
+          # SHA into the mirror, so the fetch below short-circuits and
+          # this job pays only the local mirror clone. Full tree: the
+          # root-level `cargo fmt --all` needs every workspace member's
+          # manifests and sources.
+          MIRROR_KEY: full
+          DEPTH: '2'
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
@@ -293,11 +358,16 @@ jobs:
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
-          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 --filter=blob:none "$url" "$MIRROR"; }
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            git -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"
+            # Same skip as changed-files, on HEAD (not cat-file -e, which
+            # lazy-fetches from github.com): the SHA is normally already
+            # at the mirror HEAD when this job starts.
+            [ "$(git -C "$MIRROR" rev-parse HEAD 2>/dev/null || true)" = "$GITHUB_SHA" ] && return 0
+            git -C "$MIRROR" fetch --depth "$DEPTH" --no-tags origin "$GITHUB_SHA"
           }
+          warm_sha(){ git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
             # Serialize runs sharing this mirror and self-heal stale
@@ -306,32 +376,38 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
-            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
+            flock -w 900 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v5"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
-              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time partial clone from github.com"
+              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
               retry seed || { echo "::error::mirror seed failed"; exit 1; }
               : > "$MARK"
             fi
             git -C "$MIRROR" remote set-url origin "$url"
-            git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
-            git -C "$MIRROR" sparse-checkout set $SPARSE
-            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
+            # Sibling jobs clone this mirror locklessly (the flock is
+            # released before their clone), so the mirror must never
+            # self-repack mid-read: a gc pruning packs would race those
+            # clones. Fetches only bring small delta packs, so leaving
+            # them unconsolidated is fine; bump the seed marker version to
+            # reset the mirror if it ever needs a compact.
+            git -C "$MIRROR" config gc.auto 0
+            retry fetch_sha || { echo "::error::mirror fetch failed"; exit 1; }
+            retry warm_sha || { echo "::error::mirror checkout failed"; exit 1; }
+            # Release the mirror lock before the workspace clone: it (and
+            # the checkout) only reads the mirror. Holding the flock through
+            # it serializes the sibling jobs of one run behind a pure-local
+            # copy for no benefit.
+            exec 9>&-
             # Use Git transport instead of copying a live .git directory: auto
             # maintenance can remove tmp_pack files while cp traverses it.
             # Follow the detached HEAD, avoiding stale shallow branch tips.
-            git -C "$MIRROR" config uploadpack.allowFilter true
-            git clone --no-local --no-checkout --depth 1 --no-tags --filter=blob:none \
+            git clone --no-local --no-checkout --depth "$DEPTH" --no-tags \
               "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
-            git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
-            git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE
             git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
-            echo "::notice::no /cache/repos volume — direct partial clone"
-            git clone --no-tags --depth 1 --filter=blob:none --no-checkout "$url" .
-            git sparse-checkout init --cone
-            git sparse-checkout set $SPARSE
+            echo "::notice::no /cache/repos volume — direct shallow clone"
+            git clone --no-tags --depth "$DEPTH" "$url" .
             git checkout -f "$GITHUB_SHA"
           fi
       - name: Install build dependencies (sudo; pod is ephemeral, no base-image pollution)

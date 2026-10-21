@@ -41,7 +41,7 @@ from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.input_params import resolve_thinking_token_budget
 from dynamo.frontend.frontend_args import FrontendConfig
 from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
-from dynamo.llm.exceptions import HttpError
+from dynamo.llm.exceptions import HttpError, InvalidArgument
 from dynamo.vllm.errors import vllm_client_error_to_http_error
 
 from .prepost import StreamingPostProcessor, preprocess_chat_request
@@ -1420,6 +1420,14 @@ class VllmProcessor:
             # Preserve request-side 400/404/422 errors for generator(), which
             # translates them at Dynamo's HTTP boundary. The generic handler
             # below is reserved for genuine internal failures.
+            raise
+        except InvalidArgument:
+            # Same contract as VLLMClientError above, for rejections the
+            # routed engine re-raises as a typed invalid-argument (see
+            # generate_error_to_pyerr in lib/bindings/python): the class is
+            # what Dynamo's HTTP boundary uses to answer a 400 carrying the
+            # backend's own message, which the generic handler below would
+            # re-wrap as an internal error instead.
             raise
         except Exception as e:
             backend_error = backend_invalid_argument_to_http_error(e)

@@ -1860,6 +1860,27 @@ class TestRoutedEnginePath:
         assert "BackendInvalidArgument" not in excinfo.value.message
 
     @pytest.mark.asyncio
+    async def test_typed_invalid_argument_passes_through(self, vllm_processor_module):
+        # The routed engine converts a backend-classified rejection into the
+        # typed InvalidArgument exception (see generate_error_to_pyerr in
+        # lib/bindings/python); its class is the token Dynamo's HTTP boundary
+        # uses to answer a 400 with the backend's message. Re-wrapping it as
+        # an unknown error would answer 500 and discard that message.
+        class _RejectingEngine(_FakeRoutedEngine):
+            async def generate(self, preprocessed, **kwargs):
+                raise InvalidArgument(
+                    "Model does not accept image input; received unsupported "
+                    "content type 'image_url'."
+                )
+
+        processor = _make_processor(vllm_processor_module, _RejectingEngine())
+
+        with pytest.raises(InvalidArgument) as excinfo:
+            await _run_generate(processor, _base_preproc())
+
+        assert "unsupported content type" in str(excinfo.value)
+
+    @pytest.mark.asyncio
     async def test_genuine_internal_failure_is_still_internal(
         self, vllm_processor_module
     ):

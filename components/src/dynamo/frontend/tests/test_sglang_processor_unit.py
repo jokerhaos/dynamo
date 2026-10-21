@@ -4469,6 +4469,45 @@ class TestClassifySglangError:
         assert _classify_sglang_error(message) is None
 
 
+class TestRoutedEngineRejections:
+    def test_typed_invalid_argument_passes_through(self):
+        """The typed rejection must reach the HTTP boundary unchanged.
+
+        The RoutedEngine binding re-raises a backend-classified rejection as
+        the typed InvalidArgument (see generate_error_to_pyerr in
+        lib/bindings/python); its class is what Dynamo's HTTP boundary uses
+        to answer a 400 carrying the backend's message. Re-wrapping it as an
+        unknown error would answer 500 and discard that message.
+        """
+
+        class _RejectingEngine(FakeRoutedEngine):
+            async def generate(self, preprocessed, **kwargs):
+                raise InvalidArgument(
+                    "Model does not accept image input; received unsupported "
+                    "content type 'image_url'."
+                )
+
+        processor = SglangProcessor(
+            tokenizer=None,
+            routed_engine=_RejectingEngine(),
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_ids=None,
+            stream_interval=20,
+        )
+
+        async def collect():
+            async for _ in processor._generate_and_stream(
+                "req-mm-reject", {"model": "test-model"}, {}, [], None
+            ):
+                pass
+
+        # The engine call is the first statement of the try block, so the
+        # exception must propagate before any post-processor can run.
+        with pytest.raises(InvalidArgument, match="unsupported content type"):
+            asyncio.run(collect())
+
+
 @pytest.mark.core
 @pytest.mark.parametrize(
     ("requested", "pin_workers"),

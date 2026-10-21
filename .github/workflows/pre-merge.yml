@@ -1,39 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Internal (China-only self-hosted) Pre Merge CI.
-#
-# Pruned from upstream NVIDIA Pre Merge down to the checks this fork actually
-# runs on the `0xtoken-arc-runner-set` runner: pre-commit (python lint/format
-# hooks) and a rust fmt/clippy/unit-test/doc matrix. Docs/recipe/fern/operator/
-# uv-hook jobs were dropped — they need Fern docs infra, XPU/GPU tester hosts,
-# or upstream Docker registry pipelines this fork doesn't have.
-#
-# Network: the runner reaches domestic mirrors (rsproxy for crates, aliyun for
-# pypi) but NOT crates.io / pypi.org / static.rust-lang.org directly. The repo
-# checkouts clone token-authenticated straight from github.com: the runner
-# already talks to github.com for the Actions API, and gh-proxy no longer
-# forwards Basic auth for git-upload-pack — a valid token gets 401 through
-# the proxy (200 direct to github.com), so proxy-routed private-repo fetches
-# die on a username prompt with no tty. Public-repo tooling clones —
-# pre-commit hook envs and cargo git dependencies — still route anonymously
-# through gh-proxy, which serves those fine, via a global git insteadOf set
-# after checkout. Each rust job writes a cargo config pointing crates.io at
-# rsproxy's sparse index with git-fetch-with-cli. The rust toolchain is
-# installed on the fly from rsproxy (rustup-init), so the runner image does
-# not need rust pre-baked. C/cc/protoc/openssl build deps are installed at
-# job start with `sudo apt-get install` (the runner runs as a
-# passwordless-sudo user, apt sources already point at the TUNA ubuntu mirror);
-# because runner pods are ephemeral this doesn't pollute the base runner image.
-#
-# Rust on this CPU runner: only lib/runtime/examples (a sub-workspace that
-# doesn't transitively pull dynamo-llm) gets clippy/unit-test/doc with
-# --no-default-features. dynamo-llm's default "block-manager" feature links
-# nixl-sys, which hard-fails without libnixl.so/CUDA, and --no-default-features
-# can't disable a DEPENDENCY's own defaults — so '.', lib/bindings/python and
-# lib/bindings/kvbm can't compile here. That full default-feature compile path
-# stays checked by the internal-build-push pipeline (dev image). `cargo fmt
-# --all --check` at the repo root still covers whole-workspace formatting.
+# 内部（国内自托管）Pre Merge CI：pre-commit + rust 检查矩阵。
+# 网络：国内镜像可达（rsproxy/aliyun），github.com token 直连（gh-proxy 不转发
+# 私有仓认证）；只有 lib/runtime/examples 子 workspace 不依赖 NIXL/CUDA、可在
+# CPU 上编译，其余完整编译由 internal-build-push 负责。
 
 name: Pre Merge
 
@@ -53,36 +24,16 @@ env:
   PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
   GH_PROXY: https://gh-proxy.com
   RS_PROXY: https://rsproxy.cn
-  # The runner image ships a global git-lfs filter and this repo tracks real
-  # media under lib/llm/tests/data/media and recipes/*/perf/traces, so every
-  # full or lib/-cone checkout smudges each LFS pointer and git-lfs downloads
-  # the actual objects from github.com's LFS endpoints. git-lfs uses its own
-  # HTTP client — http.lowSpeedLimit/Time don't apply — so a stalled transfer
-  # hangs the checkout until the step timeout (three Pre Merge runs died this
-  # way, git-lfs left as an orphan mid-checkout). No job here needs the bytes
-  # (hooks and the rust checks treat those files as opaque binaries), so skip
-  # the smudge: checkouts write pointer stubs and never touch LFS endpoints.
+  # 跳过 LFS smudge：git-lfs 自带 HTTP 客户端不受 git 超时约束，
+  # 挂起会拖死 checkout（曾三次 run 死于此）；这里只需要指针文件。
   GIT_LFS_SKIP_SMUDGE: '1'
-  #
-  # Why every checkout is INLINE here (not a reusable .github/actions/* composite
-  # referenced as astro-web3/dynamo/.github/actions/...@main): that composite is
-  # fetched by the runner via codeload.github.com/<repo>/tar.gz/<sha>, and on
-  # this domestic runner the private-repo tarball fetch is intermittently
-  # unreachable — the runner's built-in download caps at 3×100s, so a multi-
-  # minute github egress blip fails the whole run at "Set up job / Prepare all
-  # required actions" before any step runs. The inline script ships in the
-  # workflow file (delivered via the Actions API, no codeload) and its retry()
-  # loop runs 100 attempts with backoff, riding out long outages. The cost is
-  # the ~25-line checkout script duplicated per job — worth it for a reliable
-  # gate on this network.
+  # checkout 脚本内联不走复合 action：后者经 codeload 拉私有仓 tar 包
+  # 间歇性不通，会死在 "Set up job" 阶段。
 
 jobs:
   changed-files:
     runs-on: 0xtoken-arc-runner-set
-    # tj-actions/changed-files lists changed files via the PR REST API
-    # (GET /pulls/{n}/files), which needs pull-requests: read on the job
-    # token — without it the API 403s with "Resource not accessible by
-    # integration".
+    # tj-actions 经 PR REST API 取变更文件，需要 pull-requests: read。
     permissions:
       contents: read
       pull-requests: read
@@ -90,11 +41,7 @@ jobs:
       rust: ${{ steps.changes.outputs.rust }}
     steps:
       - name: Probe ssh.github.com:443 reachability (no credentials)
-        # Zero-credential link test: with no key, a working route gets
-        # "Permission denied (publickey)" — the server answered — while a
-        # blocked route times out or gets refused. Decides whether the
-        # SSH-over-443 path is even an option on this runner before anyone
-        # provisions a deploy key.
+        # 零凭据探测 443 SSH 链路是否可用。
         timeout-minutes: 3
         run: |
           set -uo pipefail
@@ -113,62 +60,25 @@ jobs:
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
-          # Read-only deploy key for SSH-over-443 fetches (empty until the
-          # repo enables deploy keys and CI_DEPLOY_KEY is set; scripts then
-          # keep the HTTPS token path).
+          # SSH-443 只读 deploy key（未配置则走 HTTPS）。
           DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY || '' }}
-          # Every job in this workflow shares ONE full-tree shallow mirror
-          # under the 'pre-commit' key — the mirror that key already warms
-          # on the cache volume (its old full-clone shape matches this
-          # design), so switching keys never forces a cold re-seed: an
-          # early run that renamed the key spent 15 minutes re-downloading
-          # a whole-repo pack over this link. Whichever job grabs the
-          # mirror lock first pays the run's single github.com fetch — a
-          # small delta pack, the mirror's objects negotiate as haves —
-          # and the other jobs, plus any re-run of a failed one, find HEAD
-          # already at this SHA and skip the network entirely. Full, never
-          # blob:none: a partial mirror would push the workspace clones
-          # below into on-demand per-blob fetches from github.com, the
-          # exact flaky-link death this mirror exists to avoid; cloning
-          # the full mirror carries every blob at local-disk speed instead.
-          # DEPTH 2: push events diff against the parent commit.
+          # 三 job 共用全量浅镜像（沿用已热的 pre-commit key，换 key 会触发
+          # 全仓冷下载）；抢到锁的 job 做唯一一次 fetch，其余零网络。
+          # 不用 blob:none：partial clone 的按需 blob 请求在慢链路上必死。
           MIRROR_KEY: pre-commit
           DEPTH: '2'
           SPARSE: .github
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
-          # Clone straight from github.com with the job token in the URL
-          # userinfo — the proven internal-build-push approach. gh-proxy no
-          # longer forwards Basic auth for git-upload-pack (verified: a valid
-          # token gets 401 through the proxy, 200 direct to github.com;
-          # anonymous public-repo clones still pass through it), so the old
-          # insteadOf→gh-proxy + Authorization-extraheader checkout failed
-          # every run with "could not read Username for
-          # 'https://gh-proxy.com'". The runner does reach github.com — it
-          # polls the Actions API — and token-authenticated git is not
-          # rate-limited. Keep the low-speed cutoff: a stalled checkout must
-          # fail loudly instead of wedging the mirror flock and backing up
-          # every later run on the node.
+          # token 直连 github.com；lowSpeed 让卡死传输 60s 报错，不拖死镜像锁。
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
-          # HTTP/1.1, not HTTP/2: this link repeatedly kills h2 streams
-          # mid-transfer (curl 92 "stream not closed cleanly"), losing the
-          # whole pack; 1.1's single stream rides the lowSpeed cutoff
-          # instead and the retry() loop resumes from a kept pack.
+          # HTTP/1.1：该链路杀 h2 流（curl 92）会整包作废。
           git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # Prefer SSH over 443 (ssh.github.com) with the repo's read-only
-          # deploy key when the DEPLOY_KEY secret exists: no third-party
-          # proxy ever touches the credentials (gh-proxy 401s private-repo
-          # auth), and SSH's single connection sidesteps the h2 stream
-          # resets (curl 92) that kill whole packs on the HTTPS path.
-          # ServerAlive* makes a dead link error out within ~2min so
-          # retry() takes over — SSH has no http.lowSpeed equivalent. The
-          # probe runs under a 30s timeout; anything but a successful
-          # authentication falls back to the HTTPS token URL above, so
-          # runners without the secret (or with 443-SSH blocked) keep the
-          # exact previous behavior.
+          # 有 DEPLOY_KEY 时优先 SSH-443（无第三方、单连接不受 h2 影响）；
+          # 30s 探测失败自动回落 HTTPS，ServerAlive 让断链及时报错。
           if [ -n "${DEPLOY_KEY:-}" ]; then
             mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
             printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
@@ -194,24 +104,15 @@ jobs:
           seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            # Skip on HEAD, never `cat-file -e`: on this repo cat-file would
-            # lazy-fetch the object from github.com — a hidden network trip.
-            # HEAD sits at $GITHUB_SHA only after a previous fetch+warm of
-            # exactly this SHA, so re-runs and same-run sibling jobs skip.
+            # 用 HEAD 判断（cat-file 会隐式 lazy-fetch）：HEAD 已在该 SHA 则零网络。
             [ "$(git -C "$MIRROR" rev-parse HEAD 2>/dev/null || true)" = "$GITHUB_SHA" ] && return 0
             git -C "$MIRROR" fetch --depth "$DEPTH" --no-tags origin "$GITHUB_SHA"
           }
-          # Checkout split out of fetch_sha so a skipped fetch still ends
-          # with the mirror HEAD at the SHA: the workspace clone below
-          # follows the advertised HEAD, and a fetch-by-SHA leaves HEAD at
-          # the old tip. Retried like the fetch.
+          # fetch 跳过时也要把镜像 HEAD 指到目标 SHA（workspace 克隆跟随它）。
           warm_sha(){ git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
-            # Serialize runs sharing this mirror and self-heal stale
-            # .git/*.lock: cancel-in-progress kills jobs mid-fetch, which
-            # otherwise wedges every later run on this volume until the
-            # lock files are removed. Holding the flock makes that safe.
+            # flock 串行化镜像写操作并自愈残留锁文件（cancel 中断 fetch 会留锁）。
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
             flock -w 1500 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
@@ -222,23 +123,13 @@ jobs:
               : > "$MARK"
             fi
             git -C "$MIRROR" remote set-url origin "$url"
-            # Sibling jobs clone this mirror locklessly (the flock is
-            # released before their clone), so the mirror must never
-            # self-repack mid-read: a gc pruning packs would race those
-            # clones. Fetches only bring small delta packs, so leaving
-            # them unconsolidated is fine; bump the seed marker version to
-            # reset the mirror if it ever needs a compact.
+            # 关自动 gc：repack 会与兄弟 job 的无锁克隆竞争。
             git -C "$MIRROR" config gc.auto 0
             retry fetch_sha || { echo "::error::mirror fetch failed"; exit 1; }
             retry warm_sha || { echo "::error::mirror checkout failed"; exit 1; }
-            # Release the mirror lock before the workspace clone: it (and
-            # the checkout) only reads the mirror. Holding the flock through
-            # it serializes the sibling jobs of one run behind a pure-local
-            # copy for no benefit.
+            # workspace 克隆只读镜像，提前放锁。
             exec 9>&-
-            # Use Git transport instead of copying a live .git directory: auto
-            # maintenance can remove tmp_pack files while cp traverses it.
-            # Follow the detached HEAD, avoiding stale shallow branch tips.
+            # Git 传输克隆（不拷 .git），跟随 detached HEAD 避开陈旧浅分支。
             git clone --no-local --no-checkout --depth "$DEPTH" --no-tags \
               "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
@@ -267,49 +158,20 @@ jobs:
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
-          # Read-only deploy key for SSH-over-443 fetches (empty until the
-          # repo enables deploy keys and CI_DEPLOY_KEY is set; scripts then
-          # keep the HTTPS token path).
+          # SSH-443 只读 deploy key（未配置则走 HTTPS）。
           DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY || '' }}
-          # Same 'pre-commit'-keyed mirror as changed-files (runs
-          # concurrently) and the rust job (after `needs: changed-files`)
-          # — this key's full-tree mirror was already warm on the volume,
-          # so no cold seed: this job usually finds HEAD already at this
-          # SHA, fetched by whichever job won the mirror lock, and skips
-          # its own github.com fetch. Full tree, no sparse:
-          # pre-commit --all-files walks the whole tree (validate-skills →
-          # .agents/skills, the docs/fern/* scripts, default
-          # trailing-whitespace/EOF hooks).
+          # 与 changed-files/rust 共用镜像（已热）；全量树：--all-files 扫全仓。
           MIRROR_KEY: pre-commit
           DEPTH: '2'
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
-          # Same rationale as the changed-files mirror: token in URL
-          # userinfo direct to github.com + low-speed cutoff. gh-proxy no
-          # longer forwards Basic auth for git-upload-pack (401 with a valid
-          # token; anonymous public-repo clones still pass), so
-          # proxy-routed private-repo fetches die on a username prompt
-          # with no tty.
+          # token 直连 github.com + 慢速断流保护 + HTTP/1.1 防 h2 流重置。
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
-          # HTTP/1.1, not HTTP/2: this link repeatedly kills h2 streams
-          # mid-transfer (curl 92 "stream not closed cleanly"), losing the
-          # whole pack; 1.1's single stream rides the lowSpeed cutoff
-          # instead and the retry() loop resumes from a kept pack.
           git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # Prefer SSH over 443 (ssh.github.com) with the repo's read-only
-          # deploy key when the DEPLOY_KEY secret exists: no third-party
-          # proxy ever touches the credentials (gh-proxy 401s private-repo
-          # auth), and SSH's single connection sidesteps the h2 stream
-          # resets (curl 92) that kill whole packs on the HTTPS path.
-          # ServerAlive* makes a dead link error out within ~2min so
-          # retry() takes over — SSH has no http.lowSpeed equivalent. The
-          # probe runs under a 30s timeout; anything but a successful
-          # authentication falls back to the HTTPS token URL above, so
-          # runners without the secret (or with 443-SSH blocked) keep the
-          # exact previous behavior.
+          # 有 DEPLOY_KEY 时优先 SSH-443，探测失败回落 HTTPS（同 changed-files）。
           if [ -n "${DEPLOY_KEY:-}" ]; then
             mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
             printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
@@ -335,20 +197,14 @@ jobs:
           seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            # Skip on HEAD, never `cat-file -e` (it lazy-fetches the
-            # object from github.com): HEAD equals $GITHUB_SHA only after
-            # a previous fetch+warm of exactly this SHA, so a re-run or a
-            # sibling job of the same run skips the fetch.
+            # HEAD 已在该 SHA 则跳过 fetch（重跑/兄弟 job 已拉过）。
             [ "$(git -C "$MIRROR" rev-parse HEAD 2>/dev/null || true)" = "$GITHUB_SHA" ] && return 0
             git -C "$MIRROR" fetch --depth "$DEPTH" --no-tags origin "$GITHUB_SHA"
           }
           warm_sha(){ git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
-            # Serialize runs sharing this mirror and self-heal stale
-            # .git/*.lock: cancel-in-progress kills jobs mid-fetch, which
-            # otherwise wedges every later run on this volume until the
-            # lock files are removed. Holding the flock makes that safe.
+            # flock 串行化镜像写操作并自愈残留锁文件。
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
             flock -w 1500 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
@@ -359,25 +215,14 @@ jobs:
               : > "$MARK"
             fi
             git -C "$MIRROR" remote set-url origin "$url"
-            # Sibling jobs clone this mirror locklessly (the flock is
-            # released before their clone), so the mirror must never
-            # self-repack mid-read: a gc pruning packs would race those
-            # clones. Fetches only bring small delta packs, so leaving
-            # them unconsolidated is fine; bump the seed marker version to
-            # reset the mirror if it ever needs a compact.
+            # 关自动 gc，避免 repack 与无锁克隆竞争。
             git -C "$MIRROR" config gc.auto 0
             retry fetch_sha || { echo "::error::mirror fetch failed"; exit 1; }
-            # Runs even when the fetch was skipped so the mirror HEAD ends
-            # at the SHA the workspace clone follows.
+            # fetch 跳过时也要把镜像 HEAD 指到目标 SHA。
             retry warm_sha || { echo "::error::mirror checkout failed"; exit 1; }
-            # Release the mirror lock before the workspace clone: it (and
-            # the checkout) only reads the mirror. Holding the flock through
-            # it serializes the sibling jobs of one run behind a pure-local
-            # copy for no benefit.
+            # workspace 克隆只读镜像，提前放锁。
             exec 9>&-
-            # Use Git transport instead of copying a live .git directory: auto
-            # maintenance can remove tmp_pack files while cp traverses it.
-            # Follow the detached HEAD, avoiding stale shallow branch tips.
+            # Git 传输克隆，跟随 detached HEAD 避开陈旧浅分支。
             git clone --no-local --no-checkout --depth "$DEPTH" --no-tags \
               "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
@@ -399,18 +244,11 @@ jobs:
       - name: Test independent cached checkouts
         run: '"$HOME/venv/bin/python" scripts/test_ci_checkout.py -v'
       - name: Run pre-commit (all files)
-        # Bypass pre-commit/action: its bundled actions/cache round-trips
-        # the 78MB hook-env archive through the painfully slow GitHub cache
-        # service (~0.4MB/s here) and, on restore timeouts, falls into a
-        # cold re-init. Keep hook environments on the persistent /cache/repos
-        # volume instead — restored from local disk in seconds and shared
-        # across runs. First run seeds it via gh-proxy clones (else-branch
-        # keeps the ephemeral-pod default when /cache is absent).
+        # 钩子环境放持久卷（GitHub cache 服务 ~0.4MB/s 太慢）。
         timeout-minutes: 25
         run: |
           set -euo pipefail
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
-            # Only /cache/repos is mounted from the persistent PVC.
             export PRE_COMMIT_HOME=/cache/repos/.pre-commit
             mkdir -p "$PRE_COMMIT_HOME"
             echo "PRE_COMMIT_HOME=$PRE_COMMIT_HOME (persistent volume)"
@@ -424,13 +262,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Only CPU-safe sub-workspaces that don't transitively pull dynamo-llm
-        # (whose default `block-manager` feature needs NIXL/CUDA libs not on
-        # this CPU runner). `--no-default-features` does NOT disable a
-        # dependency's own defaults, so '.', lib/bindings/python and
-        # lib/bindings/kvbm still link nixl-sys and fail here; they stay
-        # compile-checked by the build-push dev-image build. Add a crate here
-        # only after confirming it's CPU-safe.
+        # 只放不依赖 dynamo-llm（NIXL/CUDA）的 CPU 安全子 workspace。
         dir: ['lib/runtime/examples']
     permissions:
       contents: read
@@ -439,46 +271,21 @@ jobs:
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
-          # Read-only deploy key for SSH-over-443 fetches (empty until the
-          # repo enables deploy keys and CI_DEPLOY_KEY is set; scripts then
-          # keep the HTTPS token path).
+          # SSH-443 只读 deploy key（未配置则走 HTTPS）。
           DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY || '' }}
-          # Same 'pre-commit'-keyed mirror as changed-files and pre-commit.
-          # `needs: changed-files` guarantees that job already fetched the
-          # run's SHA into the mirror (or found it warm), so the fetch
-          # below short-circuits and this job pays only the local mirror
-          # clone. Full tree: the root-level `cargo fmt --all` needs every
-          # workspace member's manifests and sources.
+          # 共用镜像；changed-files 已把该 SHA 拉进镜像，fetch 直接短路。
+          # 全量树：根目录 cargo fmt --all 需要所有成员的清单和源码。
           MIRROR_KEY: pre-commit
           DEPTH: '2'
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
-          # Same rationale as the changed-files mirror: token in URL
-          # userinfo direct to github.com + low-speed cutoff — gh-proxy no
-          # longer forwards Basic auth for git-upload-pack (401 with a valid
-          # token; anonymous public-repo clones still pass), so
-          # proxy-routed private-repo fetches die on a username prompt
-          # with no tty.
+          # token 直连 github.com + 慢速断流保护 + HTTP/1.1 防 h2 流重置。
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
-          # HTTP/1.1, not HTTP/2: this link repeatedly kills h2 streams
-          # mid-transfer (curl 92 "stream not closed cleanly"), losing the
-          # whole pack; 1.1's single stream rides the lowSpeed cutoff
-          # instead and the retry() loop resumes from a kept pack.
           git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # Prefer SSH over 443 (ssh.github.com) with the repo's read-only
-          # deploy key when the DEPLOY_KEY secret exists: no third-party
-          # proxy ever touches the credentials (gh-proxy 401s private-repo
-          # auth), and SSH's single connection sidesteps the h2 stream
-          # resets (curl 92) that kill whole packs on the HTTPS path.
-          # ServerAlive* makes a dead link error out within ~2min so
-          # retry() takes over — SSH has no http.lowSpeed equivalent. The
-          # probe runs under a 30s timeout; anything but a successful
-          # authentication falls back to the HTTPS token URL above, so
-          # runners without the secret (or with 443-SSH blocked) keep the
-          # exact previous behavior.
+          # 有 DEPLOY_KEY 时优先 SSH-443，探测失败回落 HTTPS（同 changed-files）。
           if [ -n "${DEPLOY_KEY:-}" ]; then
             mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
             printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
@@ -504,19 +311,14 @@ jobs:
           seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" "$url" "$MIRROR"; }
           fetch_sha(){
             find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
-            # Same skip as changed-files, on HEAD (not cat-file -e, which
-            # lazy-fetches from github.com): the SHA is normally already
-            # at the mirror HEAD when this job starts.
+            # HEAD 已在该 SHA 则跳过 fetch。
             [ "$(git -C "$MIRROR" rev-parse HEAD 2>/dev/null || true)" = "$GITHUB_SHA" ] && return 0
             git -C "$MIRROR" fetch --depth "$DEPTH" --no-tags origin "$GITHUB_SHA"
           }
           warm_sha(){ git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
-            # Serialize runs sharing this mirror and self-heal stale
-            # .git/*.lock: cancel-in-progress kills jobs mid-fetch, which
-            # otherwise wedges every later run on this volume until the
-            # lock files are removed. Holding the flock makes that safe.
+            # flock 串行化镜像写操作并自愈残留锁文件。
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
             flock -w 1500 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
@@ -527,23 +329,13 @@ jobs:
               : > "$MARK"
             fi
             git -C "$MIRROR" remote set-url origin "$url"
-            # Sibling jobs clone this mirror locklessly (the flock is
-            # released before their clone), so the mirror must never
-            # self-repack mid-read: a gc pruning packs would race those
-            # clones. Fetches only bring small delta packs, so leaving
-            # them unconsolidated is fine; bump the seed marker version to
-            # reset the mirror if it ever needs a compact.
+            # 关自动 gc，避免 repack 与无锁克隆竞争。
             git -C "$MIRROR" config gc.auto 0
             retry fetch_sha || { echo "::error::mirror fetch failed"; exit 1; }
             retry warm_sha || { echo "::error::mirror checkout failed"; exit 1; }
-            # Release the mirror lock before the workspace clone: it (and
-            # the checkout) only reads the mirror. Holding the flock through
-            # it serializes the sibling jobs of one run behind a pure-local
-            # copy for no benefit.
+            # workspace 克隆只读镜像，提前放锁。
             exec 9>&-
-            # Use Git transport instead of copying a live .git directory: auto
-            # maintenance can remove tmp_pack files while cp traverses it.
-            # Follow the detached HEAD, avoiding stale shallow branch tips.
+            # Git 传输克隆，跟随 detached HEAD 避开陈旧浅分支。
             git clone --no-local --no-checkout --depth "$DEPTH" --no-tags \
               "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
@@ -568,11 +360,7 @@ jobs:
             '[net]' 'git-fetch-with-cli = true' \
             > "$HOME/.cargo/config.toml"
       - name: Install Rust toolchain from rsproxy
-        # Without RUSTUP_DIST_SERVER rustup downloads toolchains from
-        # static.rust-lang.org, which this runner cannot reach — the step
-        # hangs forever instead of failing. Point every rustup download
-        # at the rsproxy mirror and bound the step so a wedged download
-        # fails loudly instead of stalling the job.
+        # rustup 默认源不可达会无限挂起；全部走 rsproxy 并加超时。
         env:
           RUSTUP_DIST_SERVER: https://rsproxy.cn
           RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
@@ -582,8 +370,7 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh \
               | sh -s -- -y --profile minimal --default-toolchain stable
           fi
-          # GITHUB_PATH only takes effect in the NEXT step, so export here too
-          # so the immediate `rustup component add` below sees the shim.
+          # GITHUB_PATH 下一步才生效，这里同时 export 供 rustup 使用。
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup component add rustfmt clippy
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"

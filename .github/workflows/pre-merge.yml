@@ -89,10 +89,34 @@ jobs:
     outputs:
       rust: ${{ steps.changes.outputs.rust }}
     steps:
+      - name: Probe ssh.github.com:443 reachability (no credentials)
+        # Zero-credential link test: with no key, a working route gets
+        # "Permission denied (publickey)" — the server answered — while a
+        # blocked route times out or gets refused. Decides whether the
+        # SSH-over-443 path is even an option on this runner before anyone
+        # provisions a deploy key.
+        timeout-minutes: 3
+        run: |
+          set -uo pipefail
+          start=$(date +%s)
+          probe=$(timeout 60 ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+            -o PreferredAuthentications=publickey -o NumberOfPasswordPrompts=0 \
+            -T -p 443 git@ssh.github.com 2>&1) || true
+          rc=$?
+          elapsed=$(( $(date +%s) - start ))
+          if printf '%s' "$probe" | grep -q 'Permission denied'; then
+            echo "::notice::ssh.github.com:443 reachable in ${elapsed}s (server answered: $(printf '%s' "$probe" | head -1))"
+          else
+            echo "::warning::ssh.github.com:443 NOT reachable in ${elapsed}s (rc=$rc): $(printf '%s' "$probe" | head -2)"
+          fi
       - name: Checkout (shared full mirror, depth 2)
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
+          # Read-only deploy key for SSH-over-443 fetches (empty until the
+          # repo enables deploy keys and CI_DEPLOY_KEY is set; scripts then
+          # keep the HTTPS token path).
+          DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY || '' }}
           # Every job in this workflow shares ONE full-tree shallow mirror
           # under the 'pre-commit' key — the mirror that key already warms
           # on the cache volume (its old full-clone shape matches this
@@ -134,6 +158,36 @@ jobs:
           # instead and the retry() loop resumes from a kept pack.
           git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Prefer SSH over 443 (ssh.github.com) with the repo's read-only
+          # deploy key when the DEPLOY_KEY secret exists: no third-party
+          # proxy ever touches the credentials (gh-proxy 401s private-repo
+          # auth), and SSH's single connection sidesteps the h2 stream
+          # resets (curl 92) that kill whole packs on the HTTPS path.
+          # ServerAlive* makes a dead link error out within ~2min so
+          # retry() takes over — SSH has no http.lowSpeed equivalent. The
+          # probe runs under a 30s timeout; anything but a successful
+          # authentication falls back to the HTTPS token URL above, so
+          # runners without the secret (or with 443-SSH blocked) keep the
+          # exact previous behavior.
+          if [ -n "${DEPLOY_KEY:-}" ]; then
+            mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+            printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
+            chmod 600 "$HOME/.ssh/deploy_key"
+            printf '%s\n' \
+              'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              'ssh.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              > "$HOME/.ssh/known_hosts"
+            export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+            auth_probe=$(timeout 30 ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -T -p 443 git@ssh.github.com 2>&1 || true)
+            if printf '%s' "$auth_probe" | grep -q 'successfully authenticated'; then
+              url="ssh://git@ssh.github.com:443/${GITHUB_REPOSITORY}.git"
+              echo "::notice::git fetches over SSH (ssh.github.com:443, read-only deploy key)"
+            else
+              unset GIT_SSH_COMMAND
+              echo "::notice::ssh.github.com:443 unavailable or key rejected — HTTPS token fallback: $auth_probe"
+            fi
+          fi
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
@@ -213,6 +267,10 @@ jobs:
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
+          # Read-only deploy key for SSH-over-443 fetches (empty until the
+          # repo enables deploy keys and CI_DEPLOY_KEY is set; scripts then
+          # keep the HTTPS token path).
+          DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY || '' }}
           # Same 'pre-commit'-keyed mirror as changed-files (runs
           # concurrently) and the rust job (after `needs: changed-files`)
           # — this key's full-tree mirror was already warm on the volume,
@@ -241,6 +299,36 @@ jobs:
           # instead and the retry() loop resumes from a kept pack.
           git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Prefer SSH over 443 (ssh.github.com) with the repo's read-only
+          # deploy key when the DEPLOY_KEY secret exists: no third-party
+          # proxy ever touches the credentials (gh-proxy 401s private-repo
+          # auth), and SSH's single connection sidesteps the h2 stream
+          # resets (curl 92) that kill whole packs on the HTTPS path.
+          # ServerAlive* makes a dead link error out within ~2min so
+          # retry() takes over — SSH has no http.lowSpeed equivalent. The
+          # probe runs under a 30s timeout; anything but a successful
+          # authentication falls back to the HTTPS token URL above, so
+          # runners without the secret (or with 443-SSH blocked) keep the
+          # exact previous behavior.
+          if [ -n "${DEPLOY_KEY:-}" ]; then
+            mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+            printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
+            chmod 600 "$HOME/.ssh/deploy_key"
+            printf '%s\n' \
+              'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              'ssh.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              > "$HOME/.ssh/known_hosts"
+            export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+            auth_probe=$(timeout 30 ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -T -p 443 git@ssh.github.com 2>&1 || true)
+            if printf '%s' "$auth_probe" | grep -q 'successfully authenticated'; then
+              url="ssh://git@ssh.github.com:443/${GITHUB_REPOSITORY}.git"
+              echo "::notice::git fetches over SSH (ssh.github.com:443, read-only deploy key)"
+            else
+              unset GIT_SSH_COMMAND
+              echo "::notice::ssh.github.com:443 unavailable or key rejected — HTTPS token fallback: $auth_probe"
+            fi
+          fi
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
@@ -351,6 +439,10 @@ jobs:
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
+          # Read-only deploy key for SSH-over-443 fetches (empty until the
+          # repo enables deploy keys and CI_DEPLOY_KEY is set; scripts then
+          # keep the HTTPS token path).
+          DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY || '' }}
           # Same 'pre-commit'-keyed mirror as changed-files and pre-commit.
           # `needs: changed-files` guarantees that job already fetched the
           # run's SHA into the mirror (or found it warm), so the fetch
@@ -376,6 +468,36 @@ jobs:
           # instead and the retry() loop resumes from a kept pack.
           git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Prefer SSH over 443 (ssh.github.com) with the repo's read-only
+          # deploy key when the DEPLOY_KEY secret exists: no third-party
+          # proxy ever touches the credentials (gh-proxy 401s private-repo
+          # auth), and SSH's single connection sidesteps the h2 stream
+          # resets (curl 92) that kill whole packs on the HTTPS path.
+          # ServerAlive* makes a dead link error out within ~2min so
+          # retry() takes over — SSH has no http.lowSpeed equivalent. The
+          # probe runs under a 30s timeout; anything but a successful
+          # authentication falls back to the HTTPS token URL above, so
+          # runners without the secret (or with 443-SSH blocked) keep the
+          # exact previous behavior.
+          if [ -n "${DEPLOY_KEY:-}" ]; then
+            mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+            printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
+            chmod 600 "$HOME/.ssh/deploy_key"
+            printf '%s\n' \
+              'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              'ssh.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              > "$HOME/.ssh/known_hosts"
+            export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+            auth_probe=$(timeout 30 ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -T -p 443 git@ssh.github.com 2>&1 || true)
+            if printf '%s' "$auth_probe" | grep -q 'successfully authenticated'; then
+              url="ssh://git@ssh.github.com:443/${GITHUB_REPOSITORY}.git"
+              echo "::notice::git fetches over SSH (ssh.github.com:443, read-only deploy key)"
+            else
+              unset GIT_SSH_COMMAND
+              echo "::notice::ssh.github.com:443 unavailable or key rejected — HTTPS token fallback: $auth_probe"
+            fi
+          fi
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }

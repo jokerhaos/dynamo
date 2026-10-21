@@ -42,9 +42,9 @@ class CachedCheckoutTest(unittest.TestCase):
                 )
                 for stale_ref in (False, True):
                     with self.subTest(workflow=workflow, job=job, stale_ref=stale_ref):
-                        self.check_checkout(match.group(), stale_ref, depth)
+                        self.check_checkout(match.group(), stale_ref, depth, workflow)
 
-    def check_checkout(self, script, stale_ref, depth=None):
+    def check_checkout(self, script, stale_ref, depth=None, workflow=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             upstream, mirror, workspace = (
@@ -91,7 +91,14 @@ class CachedCheckoutTest(unittest.TestCase):
                 (upstream / directory).mkdir()
                 (upstream / directory / "fixture.txt").write_text(directory)
             old_sha = sha = commit("fixture")
-            git("clone", "--depth=1", "--filter=blob:none", upstream.as_uri(), mirror)
+            # Model each workflow's own seed(): pre-merge seeds a full
+            # shallow mirror (its workspace clones must get every blob from
+            # the mirror, never from a promisor), internal-build-push still
+            # seeds a blob:none partial mirror.
+            seed_args = ["--depth=1"]
+            if workflow == "internal-build-push.yml":
+                seed_args.append("--filter=blob:none")
+            git("clone", *seed_args, upstream.as_uri(), mirror)
             expected = "components"
             if stale_ref:
                 # Fetching a SHA leaves the mirror's original main branch behind.

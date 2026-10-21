@@ -80,16 +80,24 @@ class SglangPreprocessResult:
 _GUIDED_BARE_JSON_RE = re.compile(r"\[\s*\{")
 
 _FORCE_REASONING_PATTERNS = (
-    # qwen3-family: <|im_start|>assistant\n<think>\n
-    re.compile(r"<\|im_start\|>assistant\\n<think>\\n"),
-    # GLM-4.5/5 and similar: <|assistant|> followed by an opening <think>
+    # qwen3-family: <|im_start|>assistant\n<llm:think>\n
+    re.compile(r"<\|im_start\|>assistant\\n<llm:think>\\n"),
+    # GLM-4.5/5 and similar: <llm:think> followed by an opening <llm:think>
     # within the generation-prompt block. The template often has Jinja
-    # expressions (including a '</think>' literal) between the two, so we
-    # match the opening tag literally -- '<think>' never matches
-    # '</think>' because the '/' breaks the literal prefix.
-    re.compile(r"<\|assistant\|>[\s\S]{0,400}?<think>"),
+    # expressions (including a '<llm:/think>' literal) between the two, so we
+    # match the opening tag literally -- '<llm:think>' never matches
+    # '<llm:/think>' because the '/' breaks the literal prefix.
+    re.compile(r"<\|assistant\|>[\s\S]{0,400}?<llm:think>"),
     # generic fallback for non-delimiter-style templates
-    re.compile(r"\bassistant\b[\s\S]{0,200}?<think>"),
+    re.compile(r"\bassistant\b[\s\S]{0,200}?<llm:think>"),
+    # Hunyuan (Hy3/Hy4): the generation prompt emits the assistant header via
+    # Jinja string concatenation -- ``'assistant' ~ hy_middle_token ~
+    # think_begin_token`` -- where think_begin_token itself is
+    # ``'<think{}>'.format(HYTK)``. No literal '<think' appears before format
+    # time, so the delimiters above never match the raw template. Match the
+    # template-side constructor instead: the concat ends with think_begin_token
+    # and pairs with reasoning_effort == 'no_think' emitting the closed pair.
+    re.compile(r"think_begin_token ~ think_end_token"),
 )
 
 
@@ -117,6 +125,12 @@ _THINKING_BY_DEFAULT = {
     "interns1",
     "kimi_k2",
     "kimi_k3",
+    # Hunyuan (Hy3/Hy4): the chat template opens '<think{:suffix}>' at the
+    # generation prompt unless reasoning_effort == 'no_think'. sglang's own
+    # template_detection gives it the special_case 'hunyuan_effort' for the
+    # same reason. Opt-out kwargs mirror Qwen's enable_thinking=False plus
+    # reasoning_effort='no_think'.
+    "hunyuan",
 }
 _THINKING_OPT_IN = {"deepseek-v3", "deepseek-v4", "gemma4"}
 
@@ -179,6 +193,18 @@ def resolve_request_force_reasoning(
         if reasoning_effort is None:
             reasoning_effort = kwargs.get("reasoning_effort")
         return reasoning_effort is not None and reasoning_effort != "none"
+
+    if reasoning_parser_name == "hunyuan":
+        # The Hy3/Hy4 chat template's own opt-out is reasoning_effort ==
+        # 'no_think' (top-level request field or chat_template_kwargs);
+        # accept enable_thinking=False as an alias for parity with other
+        # thinking-by-default families.
+        effort = request.get("reasoning_effort")
+        if effort is None:
+            effort = kwargs.get("reasoning_effort")
+        if effort == "no_think":
+            return False
+        return kwargs.get("enable_thinking") is not False
 
     if reasoning_parser_name in _THINKING_BY_DEFAULT:
         flag_key = (

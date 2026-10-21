@@ -90,21 +90,25 @@ jobs:
       rust: ${{ steps.changes.outputs.rust }}
     steps:
       - name: Checkout (shared full mirror, depth 2)
-        timeout-minutes: 15
+        timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
           # Every job in this workflow shares ONE full-tree shallow mirror
-          # (the 'full' key): whichever job grabs the mirror lock first pays
-          # the run's single github.com fetch — a small delta pack, the
-          # mirror's existing objects negotiate as haves — and the other
-          # jobs, plus any re-run of a failed one, find HEAD already at
-          # this SHA and skip the network entirely. Full, never blob:none:
-          # a partial mirror would push the workspace clones below into
-          # on-demand per-blob fetches from github.com, the exact flaky-
-          # link death this mirror exists to avoid; cloning the full mirror
-          # carries every blob at local-disk speed instead. DEPTH 2: push
-          # events diff against the parent commit.
-          MIRROR_KEY: full
+          # under the 'pre-commit' key — the mirror that key already warms
+          # on the cache volume (its old full-clone shape matches this
+          # design), so switching keys never forces a cold re-seed: an
+          # early run that renamed the key spent 15 minutes re-downloading
+          # a whole-repo pack over this link. Whichever job grabs the
+          # mirror lock first pays the run's single github.com fetch — a
+          # small delta pack, the mirror's objects negotiate as haves —
+          # and the other jobs, plus any re-run of a failed one, find HEAD
+          # already at this SHA and skip the network entirely. Full, never
+          # blob:none: a partial mirror would push the workspace clones
+          # below into on-demand per-blob fetches from github.com, the
+          # exact flaky-link death this mirror exists to avoid; cloning
+          # the full mirror carries every blob at local-disk speed instead.
+          # DEPTH 2: push events diff against the parent commit.
+          MIRROR_KEY: pre-commit
           DEPTH: '2'
           SPARSE: .github
         run: |
@@ -124,6 +128,11 @@ jobs:
           # every later run on the node.
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
+          # HTTP/1.1, not HTTP/2: this link repeatedly kills h2 streams
+          # mid-transfer (curl 92 "stream not closed cleanly"), losing the
+          # whole pack; 1.1's single stream rides the lowSpeed cutoff
+          # instead and the retry() loop resumes from a kept pack.
+          git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
@@ -151,8 +160,8 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            flock -w 900 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
-            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v5"
+            flock -w 1500 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
               retry seed || { echo "::error::mirror seed failed"; exit 1; }
@@ -201,17 +210,19 @@ jobs:
       contents: read
     steps:
       - name: Checkout (shared full mirror, full tree)
-        timeout-minutes: 15
+        timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
-          # Same 'full' mirror as changed-files (runs concurrently) and the
-          # rust job (runs after `needs: changed-files`): this job usually
-          # finds HEAD already at this SHA — fetched by whichever job won
-          # the mirror lock — and skips its own github.com fetch. Full
-          # tree, no sparse: pre-commit --all-files walks the whole tree
-          # (validate-skills → .agents/skills, the docs/fern/* scripts,
-          # default trailing-whitespace/EOF hooks).
-          MIRROR_KEY: full
+          # Same 'pre-commit'-keyed mirror as changed-files (runs
+          # concurrently) and the rust job (after `needs: changed-files`)
+          # — this key's full-tree mirror was already warm on the volume,
+          # so no cold seed: this job usually finds HEAD already at this
+          # SHA, fetched by whichever job won the mirror lock, and skips
+          # its own github.com fetch. Full tree, no sparse:
+          # pre-commit --all-files walks the whole tree (validate-skills →
+          # .agents/skills, the docs/fern/* scripts, default
+          # trailing-whitespace/EOF hooks).
+          MIRROR_KEY: pre-commit
           DEPTH: '2'
         run: |
           set -euo pipefail
@@ -224,6 +235,11 @@ jobs:
           # with no tty.
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
+          # HTTP/1.1, not HTTP/2: this link repeatedly kills h2 streams
+          # mid-transfer (curl 92 "stream not closed cleanly"), losing the
+          # whole pack; 1.1's single stream rides the lowSpeed cutoff
+          # instead and the retry() loop resumes from a kept pack.
+          git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
@@ -247,8 +263,8 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            flock -w 900 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
-            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v5"
+            flock -w 1500 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
               retry seed || { echo "::error::mirror seed failed"; exit 1; }
@@ -332,16 +348,16 @@ jobs:
       contents: read
     steps:
       - name: Checkout (shared full mirror, full tree)
-        timeout-minutes: 15
+        timeout-minutes: 30
         env:
           GH_TOKEN: ${{ github.token }}
-          # Same 'full' mirror as changed-files and pre-commit. `needs:
-          # changed-files` guarantees that job already fetched the run's
-          # SHA into the mirror, so the fetch below short-circuits and
-          # this job pays only the local mirror clone. Full tree: the
-          # root-level `cargo fmt --all` needs every workspace member's
-          # manifests and sources.
-          MIRROR_KEY: full
+          # Same 'pre-commit'-keyed mirror as changed-files and pre-commit.
+          # `needs: changed-files` guarantees that job already fetched the
+          # run's SHA into the mirror (or found it warm), so the fetch
+          # below short-circuits and this job pays only the local mirror
+          # clone. Full tree: the root-level `cargo fmt --all` needs every
+          # workspace member's manifests and sources.
+          MIRROR_KEY: pre-commit
           DEPTH: '2'
         run: |
           set -euo pipefail
@@ -354,6 +370,11 @@ jobs:
           # with no tty.
           git config --global http.lowSpeedLimit 1024
           git config --global http.lowSpeedTime 60
+          # HTTP/1.1, not HTTP/2: this link repeatedly kills h2 streams
+          # mid-transfer (curl 92 "stream not closed cleanly"), losing the
+          # whole pack; 1.1's single stream rides the lowSpeed cutoff
+          # instead and the retry() loop resumes from a kept pack.
+          git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           MK="${MIRROR_KEY//\//_}"
           MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
@@ -376,8 +397,8 @@ jobs:
             # lock files are removed. Holding the flock makes that safe.
             MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            flock -w 900 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
-            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v5"
+            flock -w 1500 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
               echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
               retry seed || { echo "::error::mirror seed failed"; exit 1; }

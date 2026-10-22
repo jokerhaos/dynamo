@@ -13,7 +13,11 @@ from _routed_engine_fakes import FakeRoutedEngine
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
 import dynamo.frontend.sglang_processor as processor_module
-from dynamo.frontend.sglang_prepost import preprocess_chat_request
+from dynamo.frontend.sglang_prepost import (
+    detect_force_reasoning_from_template,
+    preprocess_chat_request,
+    resolve_request_force_reasoning,
+)
 from dynamo.frontend.sglang_processor import SglangProcessor
 
 pytestmark = [
@@ -147,3 +151,69 @@ def test_auto_guidance_receives_checkpoint_tokens(weather_request, monkeypatch):
         structural_tag_scope="always",
     )
     assert result.guided_decoding == {"structural_tag": {"type": "object"}}
+
+
+HY4_CHAT_TEMPLATE = """\
+{%- set HYTK = ':opensource' %}
+{%- set think_begin_token = '<think{}>'.format(HYTK) %}
+{%- set think_end_token = '</think{}>'.format(HYTK) %}
+{%- if add_generation_prompt %}
+    {%- if reasoning_effort == 'no_think' %}
+        {{- 'assistant' ~ think_begin_token ~ think_end_token -}}
+    {%- else %}
+        {{- 'assistant' ~ think_begin_token -}}
+    {%- endif %}
+{%- endif %}
+"""
+
+
+class Hy4Tokenizer(HunyuanTokenizer):
+    """Hy4-preview's real chat template (Tencent-Hy4-preview-FP8)."""
+
+    chat_template = HY4_CHAT_TEMPLATE
+
+
+def test_hy4_template_opens_reasoning_block():
+    assert detect_force_reasoning_from_template(HY4_CHAT_TEMPLATE)
+
+
+@pytest.mark.parametrize(
+    ("req", "expected"),
+    [
+        ({"messages": []}, True),
+        ({"messages": [], "reasoning_effort": "no_think"}, False),
+        (
+            {
+                "messages": [],
+                "chat_template_kwargs": {"reasoning_effort": "no_think"},
+            },
+            False,
+        ),
+        (
+            {"messages": [], "chat_template_kwargs": {"enable_thinking": False}},
+            False,
+        ),
+    ],
+    ids=["default-on", "effort-no-think", "kwarg-no-think", "enable-thinking-off"],
+)
+def test_hy4_reasoning_force_resolution(req, expected):
+    assert resolve_request_force_reasoning(req, "hunyuan", False) is expected
+
+
+def test_hy4_reasoning_split_end_to_end():
+    """The prompt-opened think tag routes pre-close text to reasoning_content."""
+    tokenizer = Hy4Tokenizer()
+    text = "用户问1+1。</think:opensource>答案是2"
+    request = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "1+1?"}],
+    }
+    result = preprocess_chat_request(
+        request,
+        tokenizer=tokenizer,
+        tool_call_parser_name=None,
+        reasoning_parser_name="hunyuan",
+    )
+    parsed = result.reasoning_parser.detector.parse_streaming_increment(text)
+    assert "用户问1+1。" in parsed.reasoning_text
+    assert parsed.normal_text == "答案是2"

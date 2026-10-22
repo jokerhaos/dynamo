@@ -19,7 +19,7 @@ from dynamo.common.http.base import HttpStatusError
 from dynamo.common.http.media_reference import local_media_reference
 from dynamo.common.http.url_validator import UrlValidationError, UrlValidationPolicy
 from dynamo.common.protocols.image_protocol import ImageNvExt
-from dynamo.common.storage import upload_to_fs
+from dynamo.common.storage import presign_s3_get_url, upload_to_fs
 from dynamo.llm.exceptions import InvalidArgument
 from dynamo.sglang.args import Config
 from dynamo.sglang.protocol import CreateImageRequest, ImageData, ImagesResponse
@@ -67,6 +67,7 @@ class ImageDiffusionWorkerHandler(BaseGenerativeHandler):
         self.fs = fs
         self.fs_url = config.dynamo_args.media_output_fs_url
         self.base_url = config.dynamo_args.media_output_http_url
+        self.presign_expires_s = config.dynamo_args.media_output_presign_expires_s
 
         logger.info(
             f"Image diffusion worker handler initialized with fs_url={self.fs_url}, url_base={self.base_url}"
@@ -317,7 +318,8 @@ class ImageDiffusionWorkerHandler(BaseGenerativeHandler):
             request_id: Request context ID.
 
         Returns:
-            (public URL, storage path) for the uploaded image.
+            (download URL, storage path) for the uploaded image. Private S3
+            objects use a presigned GET URL when signing is configured.
         """
         image_uuid = str(uuid.uuid4())
         image_filename = f"{image_uuid}.png"
@@ -326,7 +328,13 @@ class ImageDiffusionWorkerHandler(BaseGenerativeHandler):
         storage_path = f"users/{user_id}/generations/{request_id}/{image_filename}"
 
         url = await upload_to_fs(self.fs, storage_path, image_bytes, self.base_url)
-        return url, storage_path
+        return (
+            presign_s3_get_url(
+                self.fs_url, storage_path, expires_s=self.presign_expires_s
+            )
+            or url,
+            storage_path,
+        )
 
     async def _cleanup_uploads(self, storage_paths: list[str]) -> None:
         """Best-effort removal of uploaded files after a failed batch."""

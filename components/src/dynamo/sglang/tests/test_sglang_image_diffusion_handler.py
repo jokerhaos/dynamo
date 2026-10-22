@@ -12,6 +12,9 @@ import pytest
 from PIL import Image
 
 from dynamo.llm.exceptions import InvalidArgument
+from dynamo.sglang.request_handlers.image_diffusion import (
+    image_diffusion_handler as handler_module,
+)
 from dynamo.sglang.request_handlers.image_diffusion.image_diffusion_handler import (
     ImageDiffusionWorkerHandler,
 )
@@ -40,6 +43,7 @@ def mock_config():
     config.dynamo_args = MagicMock()
     config.dynamo_args.media_output_fs_url = "file:///tmp/images"
     config.dynamo_args.media_output_http_url = "file:///tmp/images"
+    config.dynamo_args.media_output_presign_expires_s = 3600
     return config
 
 
@@ -91,6 +95,7 @@ class TestImageDiffusionWorkerHandler:
         config.dynamo_args = MagicMock()
         config.dynamo_args.media_output_fs_url = "s3://my-bucket/images"
         config.dynamo_args.media_output_http_url = "http://localhost:8008/images"
+        config.dynamo_args.media_output_presign_expires_s = 3600
 
         handler = ImageDiffusionWorkerHandler(
             generator=mock_generator,
@@ -101,6 +106,7 @@ class TestImageDiffusionWorkerHandler:
 
         assert handler.base_url == "http://localhost:8008/images"
         assert handler.fs_url == "s3://my-bucket/images"
+        assert handler.presign_expires_s == 3600
 
     @patch("torch.cuda.empty_cache")
     def test_cleanup(self, mock_empty_cache, handler):
@@ -335,6 +341,38 @@ class TestImageDiffusionWorkerHandler:
         assert f"users/{user_id}/generations/{request_id}/" in url
         assert url.endswith(".png")
         assert storage_path.startswith(f"users/{user_id}/generations/{request_id}/")
+
+    @pytest.mark.asyncio
+    async def test_upload_to_fs_presigns_s3(self, mock_generator, mock_fs):
+        config = MagicMock()
+        config.dynamo_args.media_output_fs_url = "s3://my-bucket/images"
+        config.dynamo_args.media_output_http_url = "https://cdn.example.com/images"
+        config.dynamo_args.media_output_presign_expires_s = 3600
+        handler = ImageDiffusionWorkerHandler(mock_generator, config, fs=mock_fs)
+
+        upload = AsyncMock(return_value="s3://my-bucket/images/unpresigned.png")
+        with (
+            patch.object(handler_module, "upload_to_fs", upload),
+            patch.object(
+                handler_module,
+                "presign_s3_get_url",
+                return_value="https://my-bucket.example.com/presigned.png",
+            ) as presign,
+        ):
+            url, storage_path = await handler._upload_to_fs(
+                b"test image data", "user123", "req456"
+            )
+
+        assert url == "https://my-bucket.example.com/presigned.png"
+        upload.assert_awaited_once_with(
+            mock_fs,
+            storage_path,
+            b"test image data",
+            "https://cdn.example.com/images",
+        )
+        presign.assert_called_once_with(
+            "s3://my-bucket/images", storage_path, expires_s=3600
+        )
 
     @pytest.mark.asyncio
     async def test_generate_images_with_numpy_array(self, handler):

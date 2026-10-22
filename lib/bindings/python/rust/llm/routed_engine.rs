@@ -13,7 +13,7 @@ use dynamo_runtime::logging::{DistributedTraceContext, otel_parent_context_from_
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 
-use crate::errors::InvalidArgument;
+use crate::errors::routed_error_to_pyerr;
 use crate::to_pyerr;
 
 #[pyclass]
@@ -72,7 +72,7 @@ impl RoutedEngine {
                 let mut stream = inner
                     .generate(request_context)
                     .await
-                    .map_err(generate_error_to_pyerr)?;
+                    .map_err(routed_error_to_pyerr)?;
                 let task_context = stream.context();
                 let (tx, rx) = tokio::sync::mpsc::channel::<RsAnnotated<PyObject>>(32);
 
@@ -110,39 +110,6 @@ impl RoutedEngine {
             .instrument(dispatch_span),
         )
     }
-}
-
-/// Convert a routed-engine generate failure into a Python exception,
-/// preserving a rejection the backend classified as the caller's fault.
-///
-/// The prefill path returns the backend's typed rejection in the error
-/// chain (see `PrefillError`, which carries it as its source). `to_pyerr`
-/// would flatten the chain to `Display` text, and the Python chat
-/// processors cannot tell that text from an internal fault: their generic
-/// handlers re-wrap it as an unknown error and the HTTP boundary answers a
-/// sanitized 500. Raising the typed `InvalidArgument` exception instead
-/// keeps the classification across the boundary — the processors re-raise
-/// it, and `map_python_exception` forwards the message as a 400. The
-/// backend's class is the same trust token that mechanism already applies
-/// to typed Python `ValueError`s.
-fn generate_error_to_pyerr(error: anyhow::Error) -> PyErr {
-    use dynamo_runtime::error::{DynamoError, ErrorClass};
-
-    for cause in error.chain() {
-        let Some(dynamo_error) = cause.downcast_ref::<DynamoError>() else {
-            continue;
-        };
-        if dynamo_error.class() != ErrorClass::InvalidRequest {
-            continue;
-        }
-        let message = dynamo_error
-            .public_message()
-            .unwrap_or_else(|| dynamo_error.message());
-        if !message.is_empty() {
-            return InvalidArgument::new_err(message.to_string());
-        }
-    }
-    to_pyerr(error)
 }
 
 fn dispatch_span(
@@ -213,12 +180,14 @@ mod tests {
         Python::with_gil(|py| {
             use dynamo_runtime::error::{BackendError, ErrorType};
 
-            let chained = chained_rejection(
-                ErrorType::Backend(BackendError::InvalidArgument),
-                "Model does not accept image input; received unsupported content type 'image_url'.",
-            );
+            let rejection = dynamo_runtime::error::DynamoError::builder()
+                .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                .message("private backend diagnostic")
+                .public_message("Input length (730044 tokens) exceeds the maximum allowed length (723258 tokens). Use a shorter input or enable --allow-auto-truncate.")
+                .build();
+            let chained = anyhow::Error::new(rejection).context("Prefill execution failed");
 
-            let pyerr = generate_error_to_pyerr(chained);
+            let pyerr = routed_error_to_pyerr(chained);
 
             assert!(
                 pyerr.is_instance_of::<crate::errors::InvalidArgument>(py),
@@ -232,7 +201,7 @@ mod tests {
                 .into_owned();
             assert_eq!(
                 text,
-                "Model does not accept image input; received unsupported content type 'image_url'."
+                "Input length (730044 tokens) exceeds the maximum allowed length (723258 tokens). Use a shorter input or enable --allow-auto-truncate."
             );
         });
     }
@@ -246,7 +215,7 @@ mod tests {
             let chained =
                 chained_rejection(ErrorType::Backend(BackendError::Unknown), "engine exploded");
 
-            let pyerr = generate_error_to_pyerr(chained);
+            let pyerr = routed_error_to_pyerr(chained);
 
             assert!(!pyerr.is_instance_of::<crate::errors::InvalidArgument>(py));
             let text = pyerr
@@ -263,30 +232,78 @@ mod tests {
     }
 
     #[test]
-    fn messageless_rejections_fall_back_to_the_flattened_text() {
+    fn rejections_without_public_message_use_safe_default() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             use dynamo_runtime::error::{BackendError, ErrorType};
 
-            // A rejection with no message to forward must not invent a typed
-            // exception with an empty payload; it keeps the legacy behavior.
-            let rejection = dynamo_runtime::error::DynamoError::builder()
-                .error_type(ErrorType::Backend(BackendError::InvalidArgument))
-                .build();
-            let chained = anyhow::Error::new(rejection).context("prefill failed without a reason");
+            for diagnostic in ["", "private backend path: /srv/worker.py"] {
+                let rejection = dynamo_runtime::error::DynamoError::builder()
+                    .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                    .message(diagnostic)
+                    .build();
+                let chained = anyhow::Error::new(rejection).context("private prefill context");
 
-            let pyerr = generate_error_to_pyerr(chained);
+                let pyerr = routed_error_to_pyerr(chained);
 
-            assert!(!pyerr.is_instance_of::<crate::errors::InvalidArgument>(py));
-            let text = pyerr
-                .value(py)
-                .str()
-                .expect("flattened error keeps its text")
-                .to_string_lossy()
-                .into_owned();
-            assert!(
-                text.contains("prefill failed without a reason"),
-                "got: {text}"
+                assert!(pyerr.is_instance_of::<crate::errors::InvalidArgument>(py));
+                assert_eq!(
+                    pyerr.value(py).str().unwrap().to_str().unwrap(),
+                    "Invalid request"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn outer_error_class_is_not_overridden_by_inner_rejection() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            use dynamo_runtime::error::{DynamoError, ErrorClass};
+
+            for class in [
+                ErrorClass::Internal,
+                ErrorClass::Unavailable,
+                ErrorClass::Cancelled,
+            ] {
+                let rejection = DynamoError::builder()
+                    .class(ErrorClass::InvalidRequest)
+                    .public_message("shorten the input")
+                    .build();
+                let outer = DynamoError::builder()
+                    .class(class)
+                    .diagnostic("private outer failure")
+                    .cause(rejection)
+                    .build();
+                let error = anyhow::Error::new(outer).context("prefill execution failed");
+
+                let pyerr = routed_error_to_pyerr(error);
+
+                assert!(
+                    !pyerr.is_instance_of::<crate::errors::InvalidArgument>(py),
+                    "outer {class:?} must not become a client validation error"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_rejection_diagnostic_is_not_public() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let rejection: dynamo_runtime::error::DynamoError =
+                serde_json::from_value(serde_json::json!({
+                    "error_type": {"Backend": "InvalidArgument"},
+                    "message": "private legacy diagnostic",
+                }))
+                .unwrap();
+
+            let pyerr = routed_error_to_pyerr(anyhow::Error::new(rejection));
+
+            assert!(pyerr.is_instance_of::<crate::errors::InvalidArgument>(py));
+            assert_eq!(
+                pyerr.value(py).str().unwrap().to_str().unwrap(),
+                "Invalid request"
             );
         });
     }

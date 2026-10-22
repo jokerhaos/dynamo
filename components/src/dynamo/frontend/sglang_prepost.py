@@ -90,9 +90,8 @@ _FORCE_REASONING_PATTERNS = (
     re.compile(r"<\|assistant\|>[\s\S]{0,400}?<think>"),
     # generic fallback for non-delimiter-style templates
     re.compile(r"\bassistant\b[\s\S]{0,200}?<think>"),
-    # Hunyuan (Hy3/Hy4): think tags are built by Jinja concat
-    # ('assistant' ~ hy_middle_token ~ think_begin_token), so no literal
-    # delimiter exists pre-format; match the constructor pair instead.
+    # Hunyuan (Hy3/Hy4): think tags are built by Jinja concat, so match
+    # the constructor pair instead of any literal delimiter.
     re.compile(r"think_begin_token ~ think_end_token"),
 )
 
@@ -121,9 +120,6 @@ _THINKING_BY_DEFAULT = {
     "interns1",
     "kimi_k2",
     "kimi_k3",
-    # Hunyuan (Hy3/Hy4): thinking on by default; opt-out via the
-    # template-native reasoning_effort='no_think' (cf. sglang's
-    # 'hunyuan_effort' special case).
     "hunyuan",
 }
 _THINKING_OPT_IN = {"deepseek-v3", "deepseek-v4", "gemma4"}
@@ -189,8 +185,6 @@ def resolve_request_force_reasoning(
         return reasoning_effort is not None and reasoning_effort != "none"
 
     if reasoning_parser_name == "hunyuan":
-        # Opt-out is reasoning_effort == 'no_think' (request field or
-        # chat_template_kwargs); enable_thinking=False is a parity alias.
         effort = request.get("reasoning_effort")
         if effort is None:
             effort = kwargs.get("reasoning_effort")

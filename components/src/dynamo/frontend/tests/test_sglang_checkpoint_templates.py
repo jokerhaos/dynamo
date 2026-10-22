@@ -168,16 +168,12 @@ HY4_CHAT_TEMPLATE = """\
 
 
 class Hy4Tokenizer(HunyuanTokenizer):
-    """Hy4-preview checkpoint: the real chat template's Jinja-concatenated
-    think markers (verified against Tencent-Hunyuan/Hy4-preview-FP8)."""
+    """Hy4-preview's real chat template (Tencent-Hy4-preview-FP8)."""
 
     chat_template = HY4_CHAT_TEMPLATE
 
 
 def test_hy4_template_opens_reasoning_block():
-    """The Hy4 template builds '<think{:suffix}>' via Jinja string concat, so
-    the literal-delimiter patterns never match the raw template text; the
-    constructor-side pattern (think_begin_token ~ think_end_token) must."""
     assert detect_force_reasoning_from_template(HY4_CHAT_TEMPLATE)
 
 
@@ -201,14 +197,11 @@ def test_hy4_template_opens_reasoning_block():
     ids=["default-on", "effort-no-think", "kwarg-no-think", "enable-thinking-off"],
 )
 def test_hy4_reasoning_force_resolution(req, expected):
-    """Thinking defaults on for hunyuan; template-native no_think and the
-    parity alias enable_thinking=False both opt out."""
     assert resolve_request_force_reasoning(req, "hunyuan", False) is expected
 
 
 def test_hy4_reasoning_split_end_to_end():
-    """With force_reasoning resolved on, the sglang Hunyuan reasoning parser
-    must move pre-'</think>' text into reasoning_content."""
+    """The prompt-opened think tag routes pre-close text to reasoning_content."""
     tokenizer = Hy4Tokenizer()
     text = "用户问1+1。</think:opensource>答案是2"
     request = {

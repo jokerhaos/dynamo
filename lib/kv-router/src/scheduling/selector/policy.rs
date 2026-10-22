@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[cfg(any(test, feature = "bench"))]
 use super::DefaultWorkerPicker;
@@ -162,6 +163,11 @@ fn push_picker_candidate(
         } else {
             None
         },
+        taints: if picker_inputs.contains(WorkerInputs::TAINTS) {
+            candidate.taints.clone()
+        } else {
+            None
+        },
     });
     if picker_inputs.contains(WorkerInputs::CACHE) {
         cache_inputs.push(candidate.cache);
@@ -249,6 +255,7 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
             && state
                 .scorer_picker_inputs
                 .contains(WorkerInputs::PREFERRED_TAINT);
+        let materialize_taints = state.scorer_picker_inputs.contains(WorkerInputs::TAINTS);
         eligibility.any_eligible_worker_rank(workers, |worker, config| {
             let preferred_taint_multiplier = if materialize_preferred_taint {
                 request
@@ -257,9 +264,11 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
             } else {
                 None
             };
+            let taints = materialize_taints.then(|| Arc::new(config.taints().clone()));
             let candidate = input.row(
                 worker,
                 preferred_taint_multiplier,
+                taints,
                 state.scorer_picker_inputs,
             );
             input.track_kept_candidate(worker);
@@ -275,6 +284,8 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
         && state.filter_inputs.contains(WorkerInputs::PREFERRED_TAINT);
     let materialize_additional_preferred_taint = eligibility.pinned_worker().is_none()
         && additional_inputs.contains(WorkerInputs::PREFERRED_TAINT);
+    let materialize_filter_taints = state.filter_inputs.contains(WorkerInputs::TAINTS);
+    let materialize_additional_taints = additional_inputs.contains(WorkerInputs::TAINTS);
     let mut has_eligible_worker = false;
     let mut error = None;
     eligibility.any_eligible_worker_rank(workers, |worker, config| {
@@ -286,9 +297,11 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
         } else {
             None
         };
+        let filter_taints = materialize_filter_taints.then(|| Arc::new(config.taints().clone()));
         let filter_candidate = input.row(
             worker,
             filter_preferred_taint_multiplier,
+            filter_taints,
             state.filter_inputs,
         );
         for (inputs, filter) in &mut state.filters {
@@ -312,9 +325,12 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
         } else {
             None
         };
+        let additional_taints =
+            materialize_additional_taints.then(|| Arc::new(config.taints().clone()));
         let additional = input.row(
             worker,
             additional_preferred_taint_multiplier,
+            additional_taints,
             additional_inputs,
         );
         let candidate = filter_candidate.with_inputs_from(&additional, state.scorer_picker_inputs);

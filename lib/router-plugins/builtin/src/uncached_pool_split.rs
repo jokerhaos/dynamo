@@ -319,7 +319,9 @@ impl WorkerPicker for UncachedPoolSplitPicker {
             .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
         let candidates = input.candidates();
         if candidates.is_empty() {
-            return Err(WorkerSelectionPolicyError::failed("no eligible worker"));
+            return Err(WorkerSelectionPolicyError::no_capacity(
+                "no eligible worker",
+            ));
         }
         let cached = cached_tokens_per_row(input.cache(), candidates.len(), context.block_size());
         if cached.len() != load.len() {
@@ -341,7 +343,7 @@ impl WorkerPicker for UncachedPoolSplitPicker {
                 let cold_ids = self.cold_member_ids(candidates);
                 let rows = self.warm_candidate_rows(candidates, &cached, &cold_ids);
                 select_affine(load, &cached, rows.into_iter())
-                    .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+                    .ok_or_else(|| WorkerSelectionPolicyError::no_capacity("no eligible worker"))
             }
             Lane::Cold { taint } => {
                 let member_rows: Vec<usize> = match taint.as_deref() {
@@ -391,27 +393,27 @@ impl WorkerPicker for UncachedPoolSplitPicker {
                                 .position(|tier| Some(&tier.taint) == taint.as_ref())
                         })
                         .next()
-                    {
-                        let pools = self.parameters.pools.clone().unwrap_or_default();
-                        for tier in pools.iter().skip(index + 1) {
-                            let upgraded_rows: Vec<usize> = candidates
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, candidate)| {
-                                    candidate
-                                        .taints()
-                                        .is_some_and(|set| set.contains(&tier.taint))
-                                })
-                                .map(|(row, _)| row)
-                                .collect();
-                            if let Some(row) =
-                                select_affine(load, &cached, upgraded_rows.into_iter())
-                            {
-                                return Ok(row);
-                            }
+                {
+                    let pools = self.parameters.pools.clone().unwrap_or_default();
+                    for tier in pools.iter().skip(index + 1) {
+                        let upgraded_rows: Vec<usize> = candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, candidate)| {
+                                candidate
+                                    .taints()
+                                    .is_some_and(|set| set.contains(&tier.taint))
+                            })
+                            .map(|(row, _)| row)
+                            .collect();
+                        if let Some(row) = select_affine(load, &cached, upgraded_rows.into_iter()) {
+                            return Ok(row);
                         }
                     }
-                Err(WorkerSelectionPolicyError::failed("no eligible worker"))
+                }
+                Err(WorkerSelectionPolicyError::no_capacity(
+                    "no eligible worker",
+                ))
             }
         }
     }
@@ -660,7 +662,8 @@ mod tests {
                 shared.map(|rc| rc.borrow().clone()).unwrap_or_default(),
             ),
         };
-        let result = WorkerSelectionPolicy::new(
+
+        WorkerSelectionPolicy::new(
             KvRouterConfig::default(),
             "test",
             Vec::new(),
@@ -672,8 +675,7 @@ mod tests {
             request.eligibility(),
             BLOCK_SIZE,
         ))
-        .map(|outcome| outcome.worker);
-        result
+        .map(|outcome| outcome.worker)
     }
 
     /// Two tiers over effective prefill: [100, 160) on taint cold-1, [160, ∞) on cold-2.

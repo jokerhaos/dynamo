@@ -485,6 +485,13 @@ RUN --mount=type=bind,source=./container/deps/sglang/install_nixl_ucx_compat.sh,
 ENV LD_LIBRARY_PATH=/opt/dynamo/nixl-ucx-compat:/opt/dynamo/nixl-capi${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 {% endif %}
 
+{% if device == "cuda" and target not in ("dev", "local-dev") %}
+# Import the full worker entry point using the installed wheels, without model
+# loading or a GPU. Catch moved SGLang APIs before publishing the image.
+RUN python3 -m dynamo.sglang --help > /dev/null && \
+    python3 -m dynamo.sglang --version
+{% endif %}
+
 # Copy tests, deploy and components for CI with correct ownership
 COPY --chmod=775 --chown=dynamo:0 tests /workspace/tests
 COPY --chmod=775 --chown=dynamo:0 examples /workspace/examples

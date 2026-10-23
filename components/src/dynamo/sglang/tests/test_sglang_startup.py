@@ -18,9 +18,6 @@ from sglang.srt.entrypoints import engine as engine_module
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
-from dynamo.sglang import init_llm
-from dynamo.sglang import main as worker_main
-
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.sglang,
@@ -74,6 +71,11 @@ class _ReachedEngine(Exception):
 async def test_worker_dispatch_reaches_engine_with_native_args(
     mode, speculative, from_config, tmp_path, monkeypatch
 ):
+    # Marker-only collection uses SGLang stubs. Import the full worker only
+    # when this test executes, so collection does not need runtime-only APIs.
+    from dynamo.sglang import init_llm
+    from dynamo.sglang import main as worker_main
+
     monkeypatch.chdir(tmp_path)
     (tmp_path / "dummy").mkdir()
     # This is an existing local path, so argument parsing cannot download a

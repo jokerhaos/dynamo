@@ -178,6 +178,15 @@ env:
   BASE_IMAGE_REF: ${{ vars.BASE_IMAGE_REF != '' && vars.BASE_IMAGE_REF || 'orc.0xtoken.cn/dynamo/cuda-dl-base' }}
   WHEEL_BUILDER_IMAGE_REF: ${{ vars.WHEEL_BUILDER_IMAGE_REF != '' && vars.WHEEL_BUILDER_IMAGE_REF || 'orc.0xtoken.cn/dynamo/manylinux228-amd64:2026-09-01' }}
   UV_IMAGE_REF: ${{ vars.UV_IMAGE_REF != '' && vars.UV_IMAGE_REF || 'orc.0xtoken.cn/dynamo/uv:0.12.0' }}
+  # Skip the LFS smudge: git-lfs ships its own HTTP client that ignores
+  # git's http.lowSpeed* guards, and the runner image installs a global
+  # git-lfs filter, so every checkout of the sparse cone (lib/llm test
+  # media, recipes/*/perf/traces, ~32 MB) would smudge each pointer through
+  # it and can hang a checkout past its step timeout — the failure class
+  # that killed three Pre Merge runs before they added this. No build input
+  # needs the LFS payloads: render.py and the rewrite step read text files,
+  # and the image's copied test fixtures degrade to pointer files.
+  GIT_LFS_SKIP_SMUDGE: '1'
 
 jobs:
   build-push:
@@ -199,80 +208,137 @@ jobs:
           command -v jq
           : "${BUILDKIT_HOST:?The ARC runner must provide BUILDKIT_HOST}"
 
-      # Checkout: a shared partial-clone mirror under /cache/repos is reused
-      # across runs — only the new commit's tiny delta is fetched each time, and
-      # the work tree is cloned LOCALLY from that mirror (no 2nd github trip).
-      # No mirror yet → fresh partial clone (one-time, then cached). Serialize
-      # cache access across refs and use Git transport to create each checkout.
-      # Fetch from github.com with the job-scoped, contents:read GITHUB_TOKEN.
-      # cone omits docs/ benchmarks/ skills/.
-      - name: Checkout (cached shallow mirror + independent clone)
+      # Checkout — same strategy as Pre Merge (#54): ONE shared FULL shallow
+      # mirror under /cache/repos (MIRROR_KEY=pre-commit) that Pre Merge's
+      # jobs already keep warm, so a push to main pays a single github.com
+      # fetch across both workflows and every later checkout short-circuits
+      # at HEAD == SHA. No --filter=blob:none anywhere: the per-blob promisor
+      # fetches ride the flaky github.com link and die on h2 stream resets
+      # (curl 92, "could not fetch ... from promisor remote") — what killed
+      # this workflow's two latest runs, and what stretched a "successful"
+      # checkout to 46 minutes before that. The workspace clones from the
+      # local mirror over Git transport, so checkout needs zero network.
+      # The sparse cone omits docs/ benchmarks/ skills/.
+      - name: Probe ssh.github.com:443 reachability (no credentials)
+        # Zero-credential probe: evidences whether the SSH-443 route (used
+        # below when CI_DEPLOY_KEY is configured) is viable on this runner.
+        timeout-minutes: 3
+        run: |
+          set -uo pipefail
+          start=$(date +%s)
+          probe=$(timeout 60 ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+            -o PreferredAuthentications=publickey -o NumberOfPasswordPrompts=0 \
+            -T -p 443 git@ssh.github.com 2>&1) || true
+          rc=$?
+          elapsed=$(( $(date +%s) - start ))
+          if printf '%s' "$probe" | grep -q 'Permission denied'; then
+            echo "::notice::ssh.github.com:443 reachable in ${elapsed}s (server answered: $(printf '%s' "$probe" | head -1))"
+          else
+            echo "::warning::ssh.github.com:443 NOT reachable in ${elapsed}s (rc=$rc): $(printf '%s' "$probe" | head -2)"
+          fi
+
+      - name: Checkout (shared full mirror + independent clone)
+        timeout-minutes: 30
         shell: bash
         env:
-          GH_PROXY: ${{ env.GH_PROXY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # SSH-443 read-only deploy key (falls back to HTTPS when unset).
+          DEPLOY_KEY: ${{ secrets.CI_DEPLOY_KEY || '' }}
+          # Share the mirror Pre Merge already keeps warm on the volume; a
+          # different key here would trigger a one-time full cold re-seed.
+          MIRROR_KEY: pre-commit
+          DEPTH: '2'
           SPARSE: container components lib deploy tests examples dev recipes .cargo scripts
         run: |
           set -euo pipefail
           git config --global --add safe.directory '*'
-          # Clone straight from github.com with the job token (basic auth).
-          # The runner already reaches github.com (it polls the Actions API),
-          # and token-authenticated git is NOT rate-limited, so on-demand blob
-          # fetches from a partial clone won't 403. Routing this through
-          # gh-proxy does (it 403s git-upload-pack intermittently with
-          # "Web page content is not allowed" — fine for release-asset wgets,
-          # not for git clone). Partial shallow clone (--filter=blob:none):
-          # the initial clone + each per-commit fetch carry only commit+tree
-          # objects; blobs are fetched on-demand by checkout as many small
-          # per-blob pack requests through the same URL.
+          # Token direct to github.com (the runner already reaches it for the
+          # Actions API, and token-authenticated git is not rate-limited;
+          # gh-proxy 403s git-upload-pack intermittently). lowSpeed aborts a
+          # stalled transfer after 60s so retry() takes over instead of
+          # hanging the mirror lock; HTTP/1.1 because this link kills h2
+          # streams mid-pack (curl 92), losing the whole transfer.
+          git config --global http.lowSpeedLimit 1024
+          git config --global http.lowSpeedTime 60
+          git config --global http.version HTTP/1.1
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          MIRROR="/cache/repos/${GITHUB_REPOSITORY}"
+          # With a DEPLOY_KEY, prefer SSH over ssh.github.com:443 — no
+          # third-party proxy, and its single connection sidesteps the h2
+          # resets entirely. ServerAlive bounds a dead link to ~2min. A 30s
+          # probe failure falls back to the HTTPS token path, so runners
+          # without the secret behave exactly as before.
+          if [ -n "${DEPLOY_KEY:-}" ]; then
+            mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+            printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
+            chmod 600 "$HOME/.ssh/deploy_key"
+            printf '%s\n' \
+              'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              'ssh.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+              > "$HOME/.ssh/known_hosts"
+            export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
+            auth_probe=$(timeout 30 ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes -T -p 443 git@ssh.github.com 2>&1 || true)
+            if printf '%s' "$auth_probe" | grep -q 'successfully authenticated'; then
+              url="ssh://git@ssh.github.com:443/${GITHUB_REPOSITORY}.git"
+              echo "::notice::git fetches over SSH (ssh.github.com:443, read-only deploy key)"
+            else
+              unset GIT_SSH_COMMAND
+              echo "::notice::ssh.github.com:443 unavailable or key rejected — HTTPS token fallback: $auth_probe"
+            fi
+          fi
+          MK="${MIRROR_KEY//\//_}"
+          MIRROR="/cache/repos/${GITHUB_REPOSITORY}__${MK}"
           retry(){ local i; for i in $(seq 1 100); do "$@" && return 0; echo "::warning::attempt $i; sleep 3"; sleep 3; done; return 1; }
-          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth 1 --filter=blob:none "$url" "$MIRROR"; }
-          fetch_sha(){ git -C "$MIRROR" fetch --filter=blob:none --depth 1 --no-tags origin "$GITHUB_SHA" && git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
-          direct_clone(){ git clone --no-tags --depth 1 --filter=blob:none --no-checkout "$url" . && git sparse-checkout init --cone && git sparse-checkout set $SPARSE && git checkout -f "$GITHUB_SHA"; }
-
+          seed(){ rm -rf "$MIRROR" && git clone --no-tags --depth "$DEPTH" "$url" "$MIRROR"; }
+          fetch_sha(){
+            find "$MIRROR/.git" -maxdepth 1 -name '*.lock' -delete 2>/dev/null || true
+            # HEAD already at the SHA → zero network (re-run, or a sibling
+            # job/workflow fetched it while this one waited on the lock).
+            [ "$(git -C "$MIRROR" rev-parse HEAD 2>/dev/null || true)" = "$GITHUB_SHA" ] && return 0
+            git -C "$MIRROR" fetch --depth "$DEPTH" --no-tags origin "$GITHUB_SHA"
+          }
+          # The workspace clone follows the mirror's HEAD, so point it at the
+          # target SHA even when fetch_sha short-circuited.
+          warm_sha(){ git -C "$MIRROR" checkout -f "$GITHUB_SHA"; }
           find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-
           if [ -d /cache/repos ] && [ -w /cache/repos ]; then
-            mkdir -p "$(dirname "$MIRROR")"
-            # Different refs share this cache, so protect fetch and checkout too.
-            MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}.gitlock"
+            # flock serializes mirror writes (shared with Pre Merge's jobs)
+            # and self-heals leftover .lock files a cancelled fetch leaves.
+            MLOCK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.gitlock"
             exec 9>"$MLOCK"
-            flock -w 300 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
-            # Re-seed when the mirror (or this checkout version's marker) is absent.
-            # A marker (not partialclonefilter config) is the gate: older checkout
-            # versions removed origin on re-add, dropping that config and leaving a
-            # partially-populated object store that then fails full-blob checkouts.
-            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}.seed-v3"
+            flock -w 1500 9 || { echo "::error::timed out waiting for the mirror lock"; exit 1; }
+            MARK="/cache/repos/.${GITHUB_REPOSITORY//\//__}__${MK}.seed-v4"
             if [ ! -d "$MIRROR/.git" ] || [ ! -f "$MARK" ]; then
-              echo "::notice::(re)seeding mirror — one-time full shallow clone via gh-proxy"
+              echo "::notice::(re)seeding mirror ($MIRROR_KEY) — one-time full shallow clone from github.com"
               retry seed || { echo "::error::mirror seed failed"; exit 1; }
               : > "$MARK"
             fi
-            # Refresh origin's URL with THIS run's token every run. GITHUB_TOKEN is
-            # job-scoped + short-lived, and a clone from an earlier run left an
-            # expired one in remote.origin.url → 'Authentication failed' on fetch.
-            # set-url preserves remote.origin.{partialclonefilter,promisor} config.
+            # Refresh origin's URL with THIS run's token every run: GITHUB_TOKEN
+            # is job-scoped and short-lived, and a clone from an earlier run
+            # left an expired one in remote.origin.url.
             git -C "$MIRROR" remote set-url origin "$url"
-            git -C "$MIRROR" sparse-checkout init --cone >/dev/null 2>&1 || true
-            git -C "$MIRROR" sparse-checkout set $SPARSE
-            retry fetch_sha || { echo "::error::mirror fetch/checkout failed"; exit 1; }
-            # Use Git transport instead of copying a live .git directory: auto
-            # maintenance can remove tmp_pack files while cp traverses it.
-            # A shallow clone follows the detached HEAD instead of stale branch
-            # tips that can trigger repeated promisor fetches in this mirror.
-            git -C "$MIRROR" config uploadpack.allowFilter true
-            git clone --no-local --no-checkout --depth 1 --no-tags --filter=blob:none \
+            # No automatic gc: repack would race the lock-free workspace clone.
+            git -C "$MIRROR" config gc.auto 0
+            retry fetch_sha || { echo "::error::mirror fetch failed"; exit 1; }
+            retry warm_sha || { echo "::error::mirror checkout failed"; exit 1; }
+            # Clone the workspace read-only from the mirror; drop the lock
+            # before it so sibling runs are not blocked by the clone.
+            exec 9>&-
+            # Git transport clone (no .git copy; auto maintenance can remove
+            # tmp_pack files while a copy traverses them). Follows the
+            # detached HEAD instead of stale branch tips.
+            git clone --no-local --no-checkout --depth "$DEPTH" --no-tags \
               "$MIRROR" "$GITHUB_WORKSPACE"
             git -C "$GITHUB_WORKSPACE" remote set-url origin "$url"
             git -C "$GITHUB_WORKSPACE" sparse-checkout init --cone
             git -C "$GITHUB_WORKSPACE" sparse-checkout set $SPARSE
             git -C "$GITHUB_WORKSPACE" checkout --detach "$GITHUB_SHA"
           else
-            echo "no /cache/repos volume — direct shallow clone via gh-proxy"
-            cd "$GITHUB_WORKSPACE"
-            retry direct_clone || { echo "::error::repo clone/checkout failed"; exit 1; }
+            echo "::notice::no /cache/repos volume — direct shallow clone"
+            git clone --no-tags --depth "$DEPTH" --no-checkout "$url" .
+            git sparse-checkout init --cone
+            git sparse-checkout set $SPARSE
+            git checkout -f "$GITHUB_SHA"
           fi
           cd "$GITHUB_WORKSPACE"
           git clean -fdxq

@@ -91,13 +91,10 @@ class CachedCheckoutTest(unittest.TestCase):
                 (upstream / directory).mkdir()
                 (upstream / directory / "fixture.txt").write_text(directory)
             old_sha = sha = commit("fixture")
-            # Model each workflow's own seed(): pre-merge seeds a full
-            # shallow mirror (its workspace clones must get every blob from
-            # the mirror, never from a promisor), internal-build-push still
-            # seeds a blob:none partial mirror.
+            # Model each workflow's own seed(): both seed a full shallow
+            # mirror (workspace clones must get every blob from the mirror,
+            # never from a promisor remote).
             seed_args = ["--depth=1"]
-            if workflow == "internal-build-push.yml":
-                seed_args.append("--filter=blob:none")
             git("clone", *seed_args, upstream.as_uri(), mirror)
             expected = "components"
             if stale_ref:

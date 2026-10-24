@@ -173,6 +173,17 @@ as the pool (`uncached_threshold_tokens: 100000` plus `compute_workers: 2`). It 
 exclusive with `pools`, and either form must be configured: an instance without one fails at
 startup.
 
+Within a lane (warm or cold), selection scores candidates with the default policy's
+continuous cost — prompt blocks plus active prefill backlog, minus the device-overlap
+credit (`overlap_score_credit`, default 1.0), plus decode backlog and at least one block
+per active request — and samples through the router's softmax temperature
+(`selection_temperature`, defaulting to the global `router_temperature`). Overlap is a
+preference, not a gate: a prefix holder wins while it stays at the load floor, but an
+idle zero-overlap worker beats a loaded holder, first-touch traffic spreads across
+near-cost candidates instead of magnetizing onto the first row, and a late-joined worker
+can be selected — and thereby warm its local cache — rather than starving behind workers
+that already hold prefixes.
+
 Cold selection is least-loaded among eligible tier members. With `allow_tier_upgrade`
 (default `true`), a cold request whose own tier has no eligible member tries each higher
 tier in ascending order before failing — a 150K request on a saturated cold-1 may run on

@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -307,3 +308,61 @@ def test_cold_and_warm_traffic_with_tainted_worker(
     assert all(
         status == 200 for status in warm_statuses
     ), f"warm requests must succeed alongside the pool split, got: {warm_statuses}"
+
+
+@pytest.mark.usefixtures(
+    "runtime_services_dynamic_ports",
+    "predownload_tokenizers",
+)
+def test_first_touch_spreads_across_warm_workers(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    dynamo_dynamic_ports,
+    tmp_path: Path,
+) -> None:
+    """Matthew-effect regression: distinct-prefix warm traffic must not magnet onto one worker.
+
+    Under the old hard max-overlap gate every first-touch landed on one worker and the
+    rest starved; with the default-policy continuous cost plus the random tie-break,
+    independent prefixes (distinct token bases, no shared cache) must reach more than
+    one warm worker. Asserted from the frontend's router logs, where every routed
+    request records its selected worker_id.
+    """
+
+    frontend_port = allocate_frontend_ports(request, 1)[0]
+    config_path = tmp_path / "pool_split.yaml"
+    config_path.write_text(_pool_split_yaml(COLD_TAINT_PLAIN))
+
+    with MockerProcess(
+        request,
+        mocker_args=MOCKER_ARGS,
+        num_mockers=3,
+        store_backend="etcd",
+        request_plane="nats",
+        model_name=ROUTER_MODEL_NAME,
+    ) as mocker:
+        with _start_frontend(
+            request,
+            frontend_port,
+            config_path,
+            mocker.namespace,
+            "dynamo-frontend-pool-split-spread",
+        ) as frontend:
+            asyncio.run(
+                wait_for_frontend_ready(
+                    frontend_url=f"http://localhost:{frontend_port}",
+                    expected_num_workers=3,
+                    timeout=60,
+                    engine_workers=mocker,
+                    store_backend="etcd",
+                    request_plane="nats",
+                )
+            )
+            asyncio.run(_statuses(frontend_port, [_warm_prompt(i) for i in range(8)]))
+            logs = frontend.read_logs()
+
+    routed_workers = set(re.findall(r"worker_id[=:][\" ]?(\d+)", logs))
+    assert len(routed_workers) >= 2, (
+        f"distinct-prefix warm traffic must spread across warm workers, "
+        f"routed worker ids: {sorted(routed_workers)}"
+    )

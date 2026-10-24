@@ -11,11 +11,13 @@ Core scenarios from the pool-split E2E matrix:
 - 3.3  cold requests keep succeeding while the warm pool is saturated
 - 5.1  warm traffic is unaffected by the cold pool
 
-Pool membership is injected through the mocker's topology support: the per-process
-``extra_env`` of ``MockerProcess`` plus a mount directory whose file name is the domain
-(``worker_pool``) and whose content is the value (``cold-1``). The resulting canonical
-taint ``dynamo.topology/worker_pool=cold-1`` is what the policy's ``pools[].taint``
-matches.
+Pool membership is injected through plain worker taints: the per-process ``extra_env``
+of ``MockerProcess`` sets ``DYN_WORKER_TAINTS=worker_pool=cold-1`` (the simplest
+declaration; a comma-separated list of plain taints read by every worker entrypoint).
+The taint string must match the policy's ``pools[].taint`` exactly. The scenario that
+asserts successful placement covers the equivalent topology declaration
+(``dynamo.topology/worker_pool=cold-1`` from topology domain files) as well, so both
+supported declaration paths stay exercised.
 
 Placement is asserted through behavior rather than worker ids: scenario 3.1 runs the
 same cold workload against a cluster where no worker carries the taint, and expects the
@@ -52,6 +54,8 @@ pytestmark = [
 ]
 
 COLD_TAINT = "dynamo.topology/worker_pool=cold-1"
+# The env-declared form of the same membership: a plain taint, no topology files.
+COLD_TAINT_PLAIN = "worker_pool=cold-1"
 BACKEND_MAX_NUM_SEQS = 4
 
 # Token geometry: with block size 16, a 96-token prompt sits below the 128-token
@@ -59,7 +63,9 @@ BACKEND_MAX_NUM_SEQS = 4
 WARM_TOKENS = 96
 COLD_TOKENS = 160
 
-POOL_SPLIT_YAML = f"""\
+
+def _pool_split_yaml(cold_taint: str) -> str:
+    return f"""\
 worker_selection:
   # The mocker frontend routes in aggregated mode (phase=Aggregated), so the pool-split
   # policy must be selected for that stage; prefill keeps it too for disagg topologies.
@@ -71,8 +77,9 @@ worker_selection:
       parameters:
         pools:
           - min_uncached_tokens: 128
-            taint: {COLD_TAINT}
+            taint: {cold_taint}
 """
+
 
 MOCKER_ARGS: dict[str, Any] = {
     "speedup_ratio": 1.0,
@@ -92,6 +99,10 @@ def _cold_taint_env(topology_dir: Path, value: str) -> dict[str, str]:
         "DYN_KV_TRANSFER_DOMAIN": "worker_pool",
         "DYN_TOPOLOGY_MOUNT_PATH": str(topology_dir),
     }
+
+
+def _plain_taint_env(taint: str) -> dict[str, str]:
+    return {"DYN_WORKER_TAINTS": taint}
 
 
 def _cold_prompt(request_index: int) -> list[int]:
@@ -183,7 +194,7 @@ def test_cold_tier_without_tainted_worker_rejects(
     # need their own random system port; a shared fixed port collides on worker 2.
     frontend_port = allocate_frontend_ports(request, 1)[0]
     config_path = tmp_path / "pool_split.yaml"
-    config_path.write_text(POOL_SPLIT_YAML)
+    config_path.write_text(_pool_split_yaml(COLD_TAINT_PLAIN))
 
     with MockerProcess(
         request,
@@ -231,16 +242,18 @@ def test_cold_and_warm_traffic_with_tainted_worker(
 ) -> None:
     """1.1 + 5.1: with a tainted worker present, both lanes succeed.
 
-    A separate tainted mocker publishes the cold taint; cold requests (fresh 160-token
-    prompts) must succeed because their tier has a member, and warm requests must also
-    succeed — proving the pool split does not disturb the warm lane.
+    A separate tainted mocker publishes the cold taint through the topology
+    declaration (domain file ``worker_pool`` containing ``cold-1``, yielding the
+    canonical taint); cold requests (fresh 160-token prompts) must succeed because
+    their tier has a member, and warm requests must also succeed — proving the pool
+    split does not disturb the warm lane.
     """
 
     # No DYN_SYSTEM_PORT monkeypatch: the frontend strips it and mocker workers each
     # need their own random system port; a shared fixed port collides on worker 2.
     frontend_port = allocate_frontend_ports(request, 1)[0]
     config_path = tmp_path / "pool_split.yaml"
-    config_path.write_text(POOL_SPLIT_YAML)
+    config_path.write_text(_pool_split_yaml(COLD_TAINT))
 
     shared_namespace = f"test-namespace-pool-split-{generate_random_suffix()}"
     with MockerProcess(

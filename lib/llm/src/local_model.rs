@@ -337,6 +337,9 @@ impl LocalModelBuilder {
             .validate_config()
             .map_err(anyhow::Error::msg)?;
         self.runtime_config.add_topology_taints();
+        self.runtime_config
+            .populate_worker_taints_from_env()
+            .map_err(anyhow::Error::msg)?;
 
         let template = self
             .template_file

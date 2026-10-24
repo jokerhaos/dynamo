@@ -157,10 +157,16 @@ worker_selection:
 
 Each tier is a `[min_uncached_tokens, max_uncached_tokens)` band over effective prefill bound to
 a worker taint. Bands must be ordered and disjoint; gaps between bands are Warm and select
-normally. Membership is declared by the workers: label the pool pods so they publish the taint
-(for example via `topology_domains` with `DYN_TOPOLOGY_ENABLED=true`, which turns
-`worker_pool: cold-1` into the canonical taint above), and scaling a pool is a deployment
-change rather than a router change. Workers carrying no taint never serve Cold traffic.
+normally. Membership is declared by the workers themselves, and scaling a pool is a deployment
+change rather than a router change. The simplest declaration is the `DYN_WORKER_TAINTS`
+environment variable: a comma-separated list of plain taints every worker entrypoint reads at
+startup, for example `DYN_WORKER_TAINTS=worker_pool=cold-1` on the pool pods. The taint must
+match `pools[].taint` exactly (any `key=value` string works; the canonical
+`dynamo.topology/...` form is reserved for topology-derived taints). The equivalent
+topology declaration — `topology_domains` with `DYN_TOPOLOGY_ENABLED=true`, which turns
+`worker_pool: cold-1` into the canonical taint above — additionally enforces KV-transfer
+constraints between prefill and decode, so prefer `DYN_WORKER_TAINTS` when the taint is only
+a pool marker. Workers carrying no taint never serve Cold traffic.
 
 For a single-tier deployment without labels, a convenience mode takes the first N candidates
 as the pool (`uncached_threshold_tokens: 100000` plus `compute_workers: 2`). It is mutually
@@ -556,6 +562,13 @@ Topology-aware KV transfer is configured on workers through runtime metadata, no
 
 For the full runtime contract and routing behavior, see [Topology-Aware KV Transfer](topology-aware-kv-transfer.md).
 For the Kubernetes configuration fields, see the [KvTransferPolicy API](../../../../reference/kubernetes-api/full-api-reference.mdx#kvtransferpolicy).
+
+Workers that only need a pool-membership marker (for example for
+`dynamo-uncached-pool-split` tiers) can declare plain taints without the topology
+machinery: set `DYN_WORKER_TAINTS` to a comma-separated list of plain `key=value`
+taints (for example `DYN_WORKER_TAINTS=worker_pool=cold-1`) on the worker. Entries
+using the reserved `dynamo.topology/` prefix are rejected at startup; publish those
+through topology domain files instead.
 
 ## Block Tracking
 

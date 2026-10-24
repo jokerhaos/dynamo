@@ -15,6 +15,13 @@
 //! that taint; below every band, or in a gap between bands, it selects normally across all
 //! eligible workers.
 //!
+//! Within a lane, selection scores candidates with the default policy's continuous cost —
+//! prompt blocks minus overlap credits plus load terms — and samples through the router's
+//! softmax temperature, matching `selector/reference.rs` semantics. A hard max-overlap
+//! filter would starve late-joined workers (they never win a prefix, so they never warm one)
+//! and bias ties toward the first candidate row; the sampled cost keeps affinity as a
+//! preference rather than a gate while load participates on every selection.
+//!
 //! Pool membership is declared by the workers themselves through their published taints, so
 //! scaling a pool is a deployment change (label the pods) rather than a router change.
 //! Failure is loud and typed: an instance without a configured pool fails at startup, and a
@@ -91,6 +98,18 @@ struct Parameters {
     /// cold-1 spilling to cold-2). Upgrading keeps the request inside the cold-pool
     /// system; it never crosses down to a lower tier or into the warm pool.
     allow_tier_upgrade: bool,
+    /// Device-local prefix-overlap credit multiplier for in-lane scoring, mirroring the
+    /// default policy's `overlap_score_credit`: 1.0 (the default) subtracts cached blocks
+    /// one-for-one from the prompt cost, so affinity stays a strong preference; 0.0
+    /// scores on load alone. Unlike the default policy this never applies across lanes —
+    /// classification still gates on effective prefill first.
+    overlap_score_credit: Option<f64>,
+    /// Softmax sampling temperature for in-lane selection, mirroring the default policy's
+    /// `router_temperature`: 0.0 (the default) picks the minimum-cost row with a random
+    /// tie-break, which still lets an idle worker win over a loaded overlap holder; values
+    /// above 0.0 spread first-touch traffic across near-cost candidates, warming more
+    /// workers' local caches.
+    selection_temperature: Option<f64>,
 }
 
 impl Default for Parameters {
@@ -102,6 +121,8 @@ impl Default for Parameters {
             allow_warm_spillover: false,
             spillover_free_threshold: 0.5,
             allow_tier_upgrade: true,
+            overlap_score_credit: None,
+            selection_temperature: None,
         }
     }
 }
@@ -191,6 +212,11 @@ enum Lane {
 
 struct UncachedPoolSplitPicker {
     parameters: Parameters,
+    /// In-lane scoring weights resolved once per policy instance: the router's global
+    /// `overlap_score_credit` and `router_temperature` (unless the instance overrides
+    /// either) plus the active-request cost weight, so in-lane selection matches the
+    /// default policy's semantics wherever this plugin does not intentionally differ.
+    weights: Weights,
     /// Cold members observed in past selections. Overload draining removes workers from
     /// the candidate set before the picker runs, so the live candidates alone
     /// overstate the pool's headroom; the remembered union restores the denominator.
@@ -199,6 +225,17 @@ struct UncachedPoolSplitPicker {
     /// ordering: removing the taint first, then the worker, keeps this from blocking
     /// spillover indefinitely.
     seen_cold_ids: std::cell::RefCell<HashSet<WorkerId>>,
+}
+
+/// In-lane scoring weights, resolved once per policy instance.
+struct Weights {
+    overlap_score_credit: f64,
+    temperature: f64,
+    /// Per-active-request cost in blocks: the router's `decode_active_request_weight`,
+    /// floored at [`MIN_ACTIVE_REQUEST_BLOCKS`] so in-lane ties always break toward the
+    /// less loaded worker (see the constant's doc for why the default 0 is not viable
+    /// here).
+    active_request_weight: f64,
 }
 
 impl UncachedPoolSplitPicker {
@@ -338,12 +375,36 @@ impl WorkerPicker for UncachedPoolSplitPicker {
         let best_cached = cached.iter().copied().max().unwrap_or(0) + shared_cached;
         let best_effective = isl - best_cached.min(isl);
 
+        // In-lane scoring inputs: cached volume in blocks and the shared cost function,
+        // used identically by the warm and cold lanes so selection inside a lane is the
+        // default policy's continuous cost rather than a hard affinity gate.
+        let block_size = context.block_size() as usize;
+        let cached_blocks: Vec<usize> = cached
+            .iter()
+            .map(|tokens| tokens.div_ceil(block_size.max(1)))
+            .collect();
+        let request_blocks = context.request_blocks();
+        let lane_cost_row = |row: usize| {
+            lane_cost(
+                &self.weights,
+                request_blocks,
+                cached_blocks[row],
+                &load[row],
+                context.block_size(),
+            )
+        };
+
         match self.classify(isl, best_effective) {
             Lane::Warm => {
                 let cold_ids = self.cold_member_ids(candidates);
                 let rows = self.warm_candidate_rows(candidates, &cached, &cold_ids);
-                select_affine(load, &cached, rows.into_iter())
-                    .ok_or_else(|| WorkerSelectionPolicyError::no_capacity("no eligible worker"))
+                select_sampled(
+                    &self.weights,
+                    rows.iter().map(|&row| lane_cost_row(row)),
+                    rows.len(),
+                )
+                .map(|index| rows[index])
+                .ok_or_else(|| WorkerSelectionPolicyError::no_capacity("no eligible worker"))
             }
             Lane::Cold { taint } => {
                 let member_rows: Vec<usize> = match taint.as_deref() {
@@ -375,8 +436,12 @@ impl WorkerPicker for UncachedPoolSplitPicker {
                 // classification, not a policy-specific error string: the request then
                 // gets the overload status code (529, or 429 via
                 // DYN_HTTP_OVERLOAD_STATUS_CODE) with ServiceOverloaded semantics.
-                if let Some(row) = select_affine(load, &cached, member_rows.clone().into_iter()) {
-                    return Ok(row);
+                if let Some(index) = select_sampled(
+                    &self.weights,
+                    member_rows.iter().map(|&row| lane_cost_row(row)),
+                    member_rows.len(),
+                ) {
+                    return Ok(member_rows[index]);
                 }
                 // Tier upgrade: this tier has no eligible member and the switch is on,
                 // so try each higher tier (a larger uncached band) that has one. The
@@ -406,8 +471,12 @@ impl WorkerPicker for UncachedPoolSplitPicker {
                             })
                             .map(|(row, _)| row)
                             .collect();
-                        if let Some(row) = select_affine(load, &cached, upgraded_rows.into_iter()) {
-                            return Ok(row);
+                        if let Some(index) = select_sampled(
+                            &self.weights,
+                            upgraded_rows.iter().map(|&row| lane_cost_row(row)),
+                            upgraded_rows.len(),
+                        ) {
+                            return Ok(upgraded_rows[index]);
                         }
                     }
                 }
@@ -451,19 +520,88 @@ fn cached_tokens_per_row(
     }
 }
 
-/// Least-loaded row among `rows`, breaking ties by row order.
-fn least_loaded(load: &[WorkerLoadInput], rows: impl Iterator<Item = usize>) -> Option<usize> {
-    rows.min_by_key(|&row| load[row].active_requests())
+/// Minimum per-active-request cost in blocks charged inside a lane. The default
+/// policy's prefill lane sets the active-request weight to 0, which erases the load
+/// signal entirely on deployments that do not track active blocks — exactly where the
+/// Matthew effect was observed. This floor keeps one block of cost per queued request
+/// so a loaded worker loses a tie against an idle one even without token-granular load.
+const MIN_ACTIVE_REQUEST_BLOCKS: f64 = 1.0;
+
+/// In-lane cost of a candidate row in blocks, mirroring the default policy's prefill
+/// formula: this request's prompt blocks plus the worker's active prefill backlog,
+/// minus overlap credits (never below zero), plus decode backlog and per-active-request
+/// charges. Lower is better.
+///
+/// Unlike a max-overlap gate, the credit keeps affinity a preference: a worker holding
+/// the prefix wins while it stays at or near the load floor, but an idle worker's
+/// advantage in the load terms beats a partially-stale prefix, and — critically — a
+/// late-joined worker with zero overlap is still selectable, so first-touch traffic
+/// can warm its local cache instead of starving it.
+fn lane_cost(
+    weights: &Weights,
+    request_blocks: u64,
+    cached_blocks: usize,
+    load: &WorkerLoadInput,
+    block_size: u32,
+) -> f64 {
+    let overlap_credit_blocks = weights.overlap_score_credit * cached_blocks as f64;
+    let raw_prefill_blocks =
+        request_blocks as f64 + load.active_prefill_tokens() as f64 / f64::from(block_size);
+    let adjusted_prefill_blocks = (raw_prefill_blocks - overlap_credit_blocks).max(0.0);
+    let active_request_cost_blocks = weights.active_request_weight * load.active_requests() as f64;
+    adjusted_prefill_blocks + load.decode_cost_blocks() + active_request_cost_blocks
 }
 
-/// Normal selection: least-loaded worker among the largest cached-token holders.
-fn select_affine(
-    load: &[WorkerLoadInput],
-    cached: &[usize],
-    rows: impl Iterator<Item = usize> + Clone,
+/// Sample a row from `rows` by their costs: minimum cost with a random tie-break at
+/// temperature 0, softmax over near-cost candidates above it — the same shape as the
+/// default policy's sampling, so both lanes share tie-break and exploration behavior.
+fn select_sampled(
+    weights: &Weights,
+    costs: impl Iterator<Item = f64> + Clone,
+    len: usize,
 ) -> Option<usize> {
-    let max_cached = rows.clone().map(|row| cached[row]).max()?;
-    least_loaded(load, rows.filter(|row| cached[*row] == max_cached))
+    let costs: Vec<f64> = costs.collect();
+    if costs.is_empty() {
+        return None;
+    }
+    let &min = costs.iter().min_by(|a, b| a.partial_cmp(b).unwrap())?;
+    let temperature = weights.temperature;
+    if temperature <= 0.0 {
+        // Minimum cost, ties broken uniformly at random (never by row order, which
+        // would magnet first-touch traffic onto the first candidate).
+        let best: Vec<usize> = costs
+            .iter()
+            .enumerate()
+            .filter(|(_, cost)| **cost == min)
+            .map(|(row, _)| row)
+            .collect();
+        return best.get(fastrand::usize(0..best.len())).copied();
+    }
+    let max = costs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+    let magnitude = if range.is_finite() {
+        1.0
+    } else {
+        min.abs().max(max.abs())
+    };
+    let min_normalized = min / magnitude;
+    let scale = -1.0 / ((max / magnitude - min_normalized) * temperature);
+    let max_scaled = min_normalized * scale;
+    let probabilities: Vec<f64> = costs
+        .iter()
+        .map(|cost| cost / magnitude * scale - max_scaled)
+        .map(f64::exp)
+        .collect();
+    let sum: f64 = probabilities.iter().sum();
+    let sample = fastrand::f64() * sum;
+    let mut cumulative = 0.0;
+    for (row, probability) in probabilities.iter().enumerate() {
+        cumulative += probability;
+        if sample <= cumulative {
+            return Some(row);
+        }
+    }
+    Some(len - 1)
 }
 
 fn provider(
@@ -474,12 +612,24 @@ fn provider(
 
     Ok(Arc::new(
         move |config: &KvRouterConfig, worker_type, _partition| {
+            let weights = Weights {
+                overlap_score_credit: parameters
+                    .overlap_score_credit
+                    .unwrap_or(config.overlap_score_credit),
+                temperature: parameters
+                    .selection_temperature
+                    .unwrap_or(config.router_temperature),
+                active_request_weight: config
+                    .decode_active_request_weight
+                    .max(MIN_ACTIVE_REQUEST_BLOCKS),
+            };
             WorkerSelectionPolicy::new(
                 config.clone(),
                 worker_type.as_str(),
                 Vec::new(),
                 Box::new(UncachedPoolSplitPicker {
                     parameters: parameters.clone(),
+                    weights,
                     seen_cold_ids: std::cell::RefCell::new(HashSet::new()),
                 }),
             )
@@ -658,6 +808,17 @@ mod tests {
             .collect();
         let picker = UncachedPoolSplitPicker {
             parameters: parameters.clone(),
+            weights: Weights {
+                overlap_score_credit: parameters
+                    .overlap_score_credit
+                    .unwrap_or(KvRouterConfig::default().overlap_score_credit),
+                temperature: parameters
+                    .selection_temperature
+                    .unwrap_or(KvRouterConfig::default().router_temperature),
+                active_request_weight: KvRouterConfig::default()
+                    .decode_active_request_weight
+                    .max(MIN_ACTIVE_REQUEST_BLOCKS),
+            },
             seen_cold_ids: std::cell::RefCell::new(
                 shared.map(|rc| rc.borrow().clone()).unwrap_or_default(),
             ),
@@ -698,6 +859,8 @@ mod tests {
             allow_warm_spillover: false,
             spillover_free_threshold: 0.5,
             allow_tier_upgrade: true,
+            overlap_score_credit: None,
+            selection_temperature: None,
         }
     }
 
@@ -709,6 +872,8 @@ mod tests {
             allow_warm_spillover: false,
             spillover_free_threshold: 0.5,
             allow_tier_upgrade: true,
+            overlap_score_credit: None,
+            selection_temperature: None,
         }
     }
 
@@ -832,6 +997,8 @@ mod tests {
             allow_warm_spillover: false,
             spillover_free_threshold: 0.5,
             allow_tier_upgrade: true,
+            overlap_score_credit: None,
+            selection_temperature: None,
         };
         let pool_taints = HashMap::new();
         let selected =
@@ -1127,6 +1294,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected, worker(A));
+    }
+
+    #[test]
+    fn fresh_request_first_touch_spreads_across_idle_workers() {
+        // The Matthew-effect regression: identical cost rows (all idle, zero overlap) must
+        // not magnet onto the first candidate row. Over many first-touch selections the
+        // random tie-break must reach every warm worker, so each one's local cache can
+        // be warmed by some prefix.
+        let pool_taints = HashMap::new();
+        let mut selected = HashSet::new();
+        for _ in 0..200 {
+            let picked = select_result(
+                &two_tier_params(),
+                80,
+                &[(A, 0, 0), (B, 0, 0), (C, 0, 0)],
+                &pool_taints,
+            )
+            .unwrap();
+            selected.insert(picked);
+        }
+        assert_eq!(
+            selected.len(),
+            3,
+            "first touch must cover every warm worker"
+        );
+    }
+
+    #[test]
+    fn zero_overlap_worker_wins_when_overlap_holder_is_loaded() {
+        // The starvation regression: B holds the whole prefix but carries a large active
+        // prefill backlog; A has zero overlap and is idle. The continuous cost must let A
+        // win — under the old max-overlap gate B would win unconditionally and A would
+        // never receive traffic.
+        let pool_taints = HashMap::new();
+        let selected = select_result(
+            &two_tier_params(),
+            80,
+            &[(A, 0, 0), (B, 5, 64)],
+            &pool_taints,
+        )
+        .unwrap();
+        assert_eq!(selected, worker(A));
+    }
+
+    #[test]
+    fn loaded_overlap_holder_still_wins_over_idle_worker_at_the_load_floor() {
+        // Affinity remains a preference, not an accident: B holds five blocks of overlap
+        // and is otherwise at the load floor; A is idle with no overlap. B's credit
+        // (default overlap_score_credit 1.0) must keep winning deterministically.
+        let pool_taints = HashMap::new();
+        for _ in 0..20 {
+            let selected = select_result(
+                &two_tier_params(),
+                80,
+                &[(A, 0, 0), (B, 5, 0)],
+                &pool_taints,
+            )
+            .unwrap();
+            assert_eq!(selected, worker(B));
+        }
+    }
+
+    #[test]
+    fn selection_temperature_spreads_near_cost_candidates() {
+        // With a positive temperature and two near-cost workers (B marginally cheaper),
+        // sampling must sometimes pick A — the exploration that lets fresh traffic
+        // reach more than one worker. With temperature 0 the cheaper row always wins.
+        let pool_taints = HashMap::new();
+        let params = Parameters {
+            selection_temperature: Some(5.0),
+            ..two_tier_params()
+        };
+        let mut saw_a = false;
+        for _ in 0..100 {
+            let selected =
+                select_result(&params, 80, &[(A, 0, 2), (B, 0, 0)], &pool_taints).unwrap();
+            if selected == worker(A) {
+                saw_a = true;
+                break;
+            }
+        }
+        assert!(saw_a, "positive temperature must explore the costlier row");
+
+        let cold = Parameters {
+            selection_temperature: Some(0.0),
+            ..two_tier_params()
+        };
+        for _ in 0..20 {
+            let selected = select_result(&cold, 80, &[(A, 0, 2), (B, 0, 0)], &pool_taints).unwrap();
+            assert_eq!(selected, worker(B));
+        }
     }
 
     #[test]

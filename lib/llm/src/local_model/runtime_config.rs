@@ -69,6 +69,27 @@ pub fn topology_taint(domain: &str, value: &str) -> String {
     format!("{TOPOLOGY_TAINT_PREFIX}{domain}={value}")
 }
 
+/// Parse a `DYN_WORKER_TAINTS` value: comma-separated, trimmed, non-empty plain
+/// taints. Entries using the reserved topology prefix are rejected because
+/// `add_topology_taints` rebuilds that namespace from `topology_domains`.
+fn parse_worker_taints(raw: &str) -> Result<HashSet<String>, String> {
+    let mut taints = HashSet::new();
+    for entry in raw.split(',') {
+        let taint = entry.trim();
+        if taint.is_empty() {
+            return Err("DYN_WORKER_TAINTS contains an empty entry".to_string());
+        }
+        if taint.starts_with(TOPOLOGY_TAINT_PREFIX) {
+            return Err(format!(
+                "DYN_WORKER_TAINTS entry {taint:?} uses the reserved prefix {TOPOLOGY_TAINT_PREFIX}; \
+                 publish topology-derived taints through topology domain files instead"
+            ));
+        }
+        taints.insert(taint.to_string());
+    }
+    Ok(taints)
+}
+
 /// Controls when structural tags are activated based on `tool_choice`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -850,6 +871,34 @@ impl ModelRuntimeConfig {
         self
     }
 
+    /// Populate `taints` from the `DYN_WORKER_TAINTS` environment variable.
+    ///
+    /// The value is a comma-separated list of plain worker taints, for example
+    /// `worker_pool=cold-1,role=batch`, merged into any taints already set. Taints
+    /// using the reserved `dynamo.topology/` prefix are rejected: that namespace is
+    /// rebuilt from `topology_domains` by [`Self::add_topology_taints`], so
+    /// topology-derived taints must come from the topology domain files instead.
+    ///
+    /// Returns a message describing the first invalid entry, if any. If
+    /// `DYN_WORKER_TAINTS` is unset or whitespace-only, this is a no-op.
+    ///
+    /// [`LocalModel::build`](crate::local_model::LocalModel::build) calls this after
+    /// [`Self::add_topology_taints`], so env-declared and topology-derived taints
+    /// coexist on the published worker.
+    pub fn populate_worker_taints_from_env(&mut self) -> Result<(), String> {
+        let raw = std::env::var("DYN_WORKER_TAINTS")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        let taints = parse_worker_taints(&raw)?;
+        tracing::info!(?taints, "populated worker taints from DYN_WORKER_TAINTS");
+        self.taints.extend(taints);
+        Ok(())
+    }
+
     /// Populate `stable_routing_id` from the `DYN_STABLE_ROUTING_ID` environment variable.
     ///
     /// Sets the field only if it is currently unset; returns `&mut self` for chaining. If
@@ -1001,6 +1050,97 @@ mod tests {
             let mut cfg = ModelRuntimeConfig::default();
             cfg.populate_stable_routing_id_from_env();
             assert!(cfg.stable_routing_id.is_none());
+        });
+    }
+
+    #[test]
+    fn worker_taints_parse_comma_separated_and_trimmed() {
+        let taints = parse_worker_taints(" worker_pool=cold-1 , role=batch ").unwrap();
+        assert_eq!(
+            taints,
+            HashSet::from(["worker_pool=cold-1".to_string(), "role=batch".to_string()])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn populates_worker_taints_from_dyn_env() {
+        temp_env::with_vars(
+            [("DYN_WORKER_TAINTS", Some("worker_pool=cold-1, role=batch"))],
+            || {
+                let mut cfg = ModelRuntimeConfig::default();
+                cfg.populate_worker_taints_from_env().unwrap();
+                assert!(cfg.taints.contains("worker_pool=cold-1"));
+                assert!(cfg.taints.contains("role=batch"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn worker_taints_merge_with_existing() {
+        temp_env::with_vars([("DYN_WORKER_TAINTS", Some("worker_pool=cold-1"))], || {
+            let mut cfg = ModelRuntimeConfig::default();
+            cfg.taints.insert("caller/taint=value".to_string());
+            cfg.populate_worker_taints_from_env().unwrap();
+            assert!(cfg.taints.contains("caller/taint=value"));
+            assert!(cfg.taints.contains("worker_pool=cold-1"));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_worker_taints_coexist_with_topology_taints() {
+        temp_env::with_vars([("DYN_WORKER_TAINTS", Some("worker_pool=cold-1"))], || {
+            let mut cfg = ModelRuntimeConfig::default();
+            cfg.topology_domains
+                .insert("zone".to_string(), "us-east-1a".to_string());
+            cfg.add_topology_taints();
+            cfg.populate_worker_taints_from_env().unwrap();
+            assert!(cfg.taints.contains("dynamo.topology/zone=us-east-1a"));
+            assert!(cfg.taints.contains("worker_pool=cold-1"));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_prefix_worker_taint_is_rejected() {
+        temp_env::with_vars(
+            [("DYN_WORKER_TAINTS", Some("dynamo.topology/zone=us-east-1a"))],
+            || {
+                let mut cfg = ModelRuntimeConfig::default();
+                let error = cfg.populate_worker_taints_from_env().unwrap_err();
+                assert!(error.contains("reserved prefix"));
+                assert!(cfg.taints.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_worker_taints_entry_is_rejected() {
+        temp_env::with_vars([("DYN_WORKER_TAINTS", Some("worker_pool=cold-1,"))], || {
+            let mut cfg = ModelRuntimeConfig::default();
+            assert!(cfg.populate_worker_taints_from_env().is_err());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unset_or_blank_worker_taints_env_is_noop() {
+        temp_env::with_vars([("DYN_WORKER_TAINTS", Some("   "))], || {
+            let mut cfg = ModelRuntimeConfig::default();
+            cfg.populate_worker_taints_from_env().unwrap();
+            assert!(cfg.taints.is_empty());
+        });
+        temp_env::with_vars_unset(["DYN_WORKER_TAINTS"], || {
+            let mut cfg = ModelRuntimeConfig::default();
+            cfg.taints.insert("caller/taint=value".to_string());
+            cfg.populate_worker_taints_from_env().unwrap();
+            assert_eq!(
+                cfg.taints,
+                HashSet::from(["caller/taint=value".to_string()])
+            );
         });
     }
 

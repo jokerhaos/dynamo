@@ -227,6 +227,28 @@ any remains eligible, warm traffic already carrying affinity to a pool worker st
 only when the escape is allowed (below the floor, a drained warm pool rejects with the
 overload status instead), and cold requests never spill into the warm pool.
 
+For a capacity-based gate instead of the member count, set
+`spillover_max_cold_utilization` together with `spillover_capacity_tokens`:
+
+```yaml
+      parameters:
+        allow_warm_spillover: true
+        spillover_max_cold_utilization: 0.6   # escape only while cold-pool compute load <= 60%
+        spillover_capacity_tokens: 198000     # per-member prefill budget (tokens)
+        pools:
+          - min_uncached_tokens: 131072
+            taint: worker_pool=cold-1
+```
+
+Utilization is the pool's total active prefill tokens — the same load signal in-lane
+scoring uses — divided by `spillover_capacity_tokens` per eligible member. This measures
+what the member-count gate cannot: a pool whose members are all present but heavily
+loaded denies the escape, while one with real compute headroom allows it. Size
+`spillover_capacity_tokens` to the worker's realistic concurrent prefill compute budget
+(for example its per-rank `max_num_batched_tokens` ceiling or the
+`DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level). When set, it supersedes
+`spillover_free_threshold` for the spillover decision.
+
 #### Configure the Default Policy
 
 Set the default policy’s scoring parameters in the YAML passed to `--router-policy-config`:

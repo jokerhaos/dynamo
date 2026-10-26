@@ -105,11 +105,14 @@ struct Parameters {
     /// present but heavily loaded denies the escape, while one with spare compute
     /// allows it. Only consulted when `allow_warm_spillover` is `true`.
     spillover_max_cold_utilization: Option<f64>,
-    /// Per-worker prefill capacity in tokens: the utilization denominator for each
-    /// eligible cold member. Must be positive. Size it to the worker's realistic
-    /// concurrent prefill compute budget (for example its per-rank
-    /// `max_num_batched_tokens` ceiling or the `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD`
-    /// draining level). Only consulted when `spillover_max_cold_utilization` is set.
+    /// Per-DP-rank prefill capacity in tokens: the utilization denominator for each
+    /// eligible cold candidate row (candidates are per-rank, so a DP4 member
+    /// contributes four rows and four capacity shares). Must be positive. Size it to
+    /// the worker's per-rank prefill compute budget — for example the same value as
+    /// the `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level, which shares this
+    /// per-rank granularity: with them equal, a pool fully at the draining level
+    /// reads as exactly 100% utilized. Only consulted when
+    /// `spillover_max_cold_utilization` is set.
     spillover_capacity_tokens: Option<usize>,
     /// When `true` (the default), a cold request whose own tier has no eligible member
     /// may upgrade to a higher tier with one (for example a 150K request on a saturated
@@ -347,8 +350,11 @@ impl UncachedPoolSplitPicker {
             self.parameters.spillover_capacity_tokens,
         ) {
             // Capacity gate: sum the pool's active prefill tokens and compare against
-            // the per-member compute budget. A pool that is present but loaded fails
-            // this gate, while one with spare compute allows the escape.
+            // the per-rank compute budget. Candidates are (worker, dp_rank) rows, so
+            // a data-parallel member contributes one row per rank — numerator and
+            // denominator must share that granularity, or a DP4 instance would read
+            // as four times its true utilization. A pool that is present but loaded
+            // fails this gate, while one with spare compute allows the escape.
             let cold_rows: Vec<usize> = (0..candidates.len())
                 .filter(|&row| cold_ids.contains(&candidates[row].worker().worker_id))
                 .collect();
@@ -737,6 +743,7 @@ mod tests {
 
     struct TestWorker {
         taints: Arc<HashSet<String>>,
+        data_parallel_size: u32,
     }
 
     impl WorkerConfigLike for TestWorker {
@@ -744,7 +751,7 @@ mod tests {
             0
         }
         fn data_parallel_size(&self) -> u32 {
-            1
+            self.data_parallel_size
         }
         fn max_num_batched_tokens(&self) -> Option<u64> {
             None
@@ -831,11 +838,13 @@ mod tests {
             shared,
             shared_cache_blocks,
             &HashMap::new(),
+            &HashMap::new(),
         )
     }
 
     /// Like [`select_result_full`] but additionally injecting per-worker
-    /// `active_prefill_tokens`, exercising the utilization spillover gate.
+    /// `active_prefill_tokens`, exercising the utilization spillover gate, and
+    /// per-worker data-parallel sizes, exercising rank-granular capacity accounting.
     #[allow(clippy::too_many_arguments)]
     fn select_result_prefill(
         parameters: &Parameters,
@@ -846,6 +855,7 @@ mod tests {
         shared: Option<&SharedColdIds>,
         shared_cache_blocks: Option<u32>,
         prefill_tokens: &HashMap<u64, usize>,
+        dp_sizes: &HashMap<u64, u32>,
     ) -> Result<WorkerWithDpRank, dynamo_kv_router::scheduling::KvSchedulerError> {
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
@@ -881,14 +891,17 @@ mod tests {
                 .tier_overlap_blocks
                 .device
                 .insert(worker(*id), *overlap_blocks);
-            request.worker_loads.insert(
-                worker(*id),
-                WorkerLoadProjection {
-                    active_requests: *active_requests,
-                    active_prefill_tokens: prefill_tokens.get(id).copied().unwrap_or(0),
-                    ..Default::default()
-                },
-            );
+            let dp_size = dp_sizes.get(id).copied().unwrap_or(1);
+            for rank in 0..dp_size {
+                request.worker_loads.insert(
+                    WorkerWithDpRank::new(*id, rank),
+                    WorkerLoadProjection {
+                        active_requests: *active_requests,
+                        active_prefill_tokens: prefill_tokens.get(id).copied().unwrap_or(0),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         let configs: HashMap<u64, TestWorker> = workers
             .iter()
@@ -900,6 +913,7 @@ mod tests {
                             .get(id)
                             .cloned()
                             .unwrap_or_else(|| taint_set(&[])),
+                        data_parallel_size: dp_sizes.get(id).copied().unwrap_or(1),
                     },
                 )
             })
@@ -1272,6 +1286,7 @@ mod tests {
             None,
             None,
             &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
         assert!(selected == worker(A) || selected == worker(B));
@@ -1298,6 +1313,7 @@ mod tests {
             None,
             None,
             &HashMap::from([(A, 80_000), (B, 80_000)]),
+            &HashMap::new(),
         );
         let Err(error) = result else {
             panic!("loaded cold pool must deny the spillover");
@@ -1331,6 +1347,7 @@ mod tests {
             None,
             None,
             &HashMap::from([(A, 120_000)]),
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(selected, worker(A));
@@ -1357,9 +1374,55 @@ mod tests {
             None,
             None,
             &HashMap::from([(A, 90_000), (B, 50_000)]),
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(selected, worker(B));
+    }
+
+    #[test]
+    fn spillover_utilization_counts_capacity_per_dp_rank() {
+        // Rank-granularity regression: a DP4 cold member contributes four candidate
+        // rows, so both its load and its capacity share count four times. Each rank
+        // carries 60_000 of a 100_000 per-rank budget — utilization is exactly 0.6
+        // regardless of the member's data-parallel width, and the inclusive boundary
+        // allows the escape. Under a per-member denominator this pool would have read
+        // as 240% utilized and wrongly denied the escape.
+        let pool_taints = HashMap::from([(A, taint_set(&["cold-1"]))]);
+        let params = Parameters {
+            allow_warm_spillover: true,
+            spillover_max_cold_utilization: Some(0.6),
+            spillover_capacity_tokens: Some(100_000),
+            ..two_tier_params()
+        };
+        let selected = select_result_prefill(
+            &params,
+            80,
+            &[(A, 0, 0), (B, 0, 6)],
+            &pool_taints,
+            Some(vec![A]),
+            None,
+            None,
+            &HashMap::from([(A, 60_000)]),
+            &HashMap::from([(A, 4)]),
+        )
+        .unwrap();
+        assert_eq!(selected, worker(A));
+
+        // The same pool loaded past the ceiling — 80_000 per rank, utilization 0.8 —
+        // denies the escape at any data-parallel width.
+        let result = select_result_prefill(
+            &params,
+            80,
+            &[(A, 0, 0), (B, 0, 6)],
+            &pool_taints,
+            Some(vec![A]),
+            None,
+            None,
+            &HashMap::from([(A, 80_000)]),
+            &HashMap::from([(A, 4)]),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

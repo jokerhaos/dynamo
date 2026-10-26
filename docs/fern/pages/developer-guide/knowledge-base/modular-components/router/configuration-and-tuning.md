@@ -241,13 +241,16 @@ For a capacity-based gate instead of the member count, set
 ```
 
 Utilization is the pool's total active prefill tokens — the same load signal in-lane
-scoring uses — divided by `spillover_capacity_tokens` per eligible member. This measures
+scoring uses — divided by `spillover_capacity_tokens` per eligible candidate row.
+Candidates are (worker, dp_rank) rows, so a data-parallel member contributes one row
+per rank on both sides of the ratio: `spillover_capacity_tokens` is a **per-rank**
+budget, and the utilization is invariant to a member's data-parallel width. Size it to
+the worker's per-rank prefill compute budget — the same value as the
+`DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level keeps the two aligned (a pool
+fully at the draining level reads as exactly 100% utilized). This measures
 what the member-count gate cannot: a pool whose members are all present but heavily
-loaded denies the escape, while one with real compute headroom allows it. Size
-`spillover_capacity_tokens` to the worker's realistic concurrent prefill compute budget
-(for example its per-rank `max_num_batched_tokens` ceiling or the
-`DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level). When set, it supersedes
-`spillover_free_threshold` for the spillover decision.
+loaded denies the escape, while one with real compute headroom allows it. When set,
+it supersedes `spillover_free_threshold` for the spillover decision.
 
 #### Configure the Default Policy
 

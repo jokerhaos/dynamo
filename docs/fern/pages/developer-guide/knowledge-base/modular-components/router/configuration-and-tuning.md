@@ -244,13 +244,15 @@ Utilization is the pool's total active prefill tokens — the same load signal i
 scoring uses — divided by `spillover_capacity_tokens` per eligible candidate row.
 Candidates are (worker, dp_rank) rows, so a data-parallel member contributes one row
 per rank on both sides of the ratio: `spillover_capacity_tokens` is a **per-rank**
-budget, and the utilization is invariant to a member's data-parallel width. Size it to
-the worker's per-rank prefill compute budget — the same value as the
-`DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level keeps the two aligned (a pool
-fully at the draining level reads as exactly 100% utilized). This measures
-what the member-count gate cannot: a pool whose members are all present but heavily
-loaded denies the escape, while one with real compute headroom allows it. When set,
-it supersedes `spillover_free_threshold` for the spillover decision.
+budget, and the utilization is invariant to a member's data-parallel width. When
+`spillover_capacity_tokens` is unset, it inherits the router's
+`DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level — the two stay anchored to one
+number, so a pool fully at the draining level reads as exactly 100% utilized; an
+explicit `spillover_capacity_tokens` overrides the inherited value. Configuring
+`spillover_max_cold_utilization` with neither source available fails at startup. This
+measures what the member-count gate cannot: a pool whose members are all present but
+heavily loaded denies the escape, while one with real compute headroom allows it.
+When set, it supersedes `spillover_free_threshold` for the spillover decision.
 
 #### Configure the Default Policy
 

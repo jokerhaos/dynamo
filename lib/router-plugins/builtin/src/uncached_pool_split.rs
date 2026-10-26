@@ -107,12 +107,14 @@ struct Parameters {
     spillover_max_cold_utilization: Option<f64>,
     /// Per-DP-rank prefill capacity in tokens: the utilization denominator for each
     /// eligible cold candidate row (candidates are per-rank, so a DP4 member
-    /// contributes four rows and four capacity shares). Must be positive. Size it to
-    /// the worker's per-rank prefill compute budget — for example the same value as
-    /// the `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level, which shares this
-    /// per-rank granularity: with them equal, a pool fully at the draining level
-    /// reads as exactly 100% utilized. Only consulted when
-    /// `spillover_max_cold_utilization` is set.
+    /// contributes four rows and four capacity shares). Must be positive when set.
+    /// When unset, the policy inherits the router's `active_prefill_tokens_threshold`
+    /// — the `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level — so the capacity
+    /// and the draining line stay anchored to one number: a pool fully at the
+    /// draining level reads as exactly 100% utilized. Configuring it explicitly
+    /// still wins over the inherited value. Only consulted when
+    /// `spillover_max_cold_utilization` is set; when neither a value nor the env
+    /// var provides one, startup fails rather than guessing a capacity.
     spillover_capacity_tokens: Option<usize>,
     /// When `true` (the default), a cold request whose own tier has no eligible member
     /// may upgrade to a higher tier with one (for example a 150K request on a saturated
@@ -177,12 +179,6 @@ impl Parameters {
         {
             return Err(WorkerSelectionPolicyProviderError::new(
                 "spillover_capacity_tokens must be positive when set",
-            ));
-        }
-        if self.spillover_capacity_tokens.is_some() && self.spillover_max_cold_utilization.is_none()
-        {
-            return Err(WorkerSelectionPolicyProviderError::new(
-                "spillover_capacity_tokens requires spillover_max_cold_utilization",
             ));
         }
         match (&self.pools, self.compute_workers) {
@@ -280,6 +276,13 @@ struct Weights {
     /// less loaded worker (see the constant's doc for why the default 0 is not viable
     /// here).
     active_request_weight: f64,
+    /// Per-DP-rank prefill capacity for the spillover utilization gate: the explicit
+    /// `spillover_capacity_tokens` parameter, or the inherited
+    /// `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` draining level when the parameter is
+    /// unset. `None` disables the capacity gate (and when
+    /// `spillover_max_cold_utilization` is configured without any capacity source,
+    /// the factory fails at startup instead).
+    spillover_capacity_tokens: Option<usize>,
 }
 
 impl UncachedPoolSplitPicker {
@@ -347,7 +350,7 @@ impl UncachedPoolSplitPicker {
         }
         if let (Some(max_utilization), Some(capacity)) = (
             self.parameters.spillover_max_cold_utilization,
-            self.parameters.spillover_capacity_tokens,
+            self.weights.spillover_capacity_tokens,
         ) {
             // Capacity gate: sum the pool's active prefill tokens and compare against
             // the per-rank compute budget. Candidates are (worker, dp_rank) rows, so
@@ -690,6 +693,26 @@ fn provider(
 
     Ok(Arc::new(
         move |config: &KvRouterConfig, worker_type, _partition| {
+            // Capacity inheritance: an explicit spillover_capacity_tokens wins; when
+            // unset, the utilization gate inherits the router's draining level
+            // (DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD) so the two stay anchored to one
+            // number. With no source at all the gate would have a ratio without a
+            // denominator, which is a configuration error, not a silent default.
+            let spillover_capacity_tokens = parameters.spillover_capacity_tokens.or_else(|| {
+                config
+                    .active_prefill_tokens_threshold
+                    .map(|threshold| threshold as usize)
+            });
+            if parameters.spillover_max_cold_utilization.is_some()
+                && spillover_capacity_tokens.is_none()
+            {
+                // Fail the first worker partition build; `WorkerSelectionPolicy::new`
+                // construction errors surface at startup.
+                panic!(
+                    "dynamo-uncached-pool-split: spillover_max_cold_utilization requires \
+                     spillover_capacity_tokens or DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD"
+                );
+            }
             let weights = Weights {
                 overlap_score_credit: parameters
                     .overlap_score_credit
@@ -700,6 +723,7 @@ fn provider(
                 active_request_weight: config
                     .decode_active_request_weight
                     .max(MIN_ACTIVE_REQUEST_BLOCKS),
+                spillover_capacity_tokens,
             };
             WorkerSelectionPolicy::new(
                 config.clone(),
@@ -857,6 +881,36 @@ mod tests {
         prefill_tokens: &HashMap<u64, usize>,
         dp_sizes: &HashMap<u64, u32>,
     ) -> Result<WorkerWithDpRank, dynamo_kv_router::scheduling::KvSchedulerError> {
+        select_result_with_config(
+            &KvRouterConfig::default(),
+            parameters,
+            isl_tokens,
+            workers,
+            pool_taints,
+            allowed,
+            shared,
+            shared_cache_blocks,
+            prefill_tokens,
+            dp_sizes,
+        )
+    }
+
+    /// Like [`select_result_prefill`] but carrying the router configuration the
+    /// factory would resolve against, exercising the spillover-capacity inheritance
+    /// from `active_prefill_tokens_threshold`.
+    #[allow(clippy::too_many_arguments)]
+    fn select_result_with_config(
+        config: &KvRouterConfig,
+        parameters: &Parameters,
+        isl_tokens: usize,
+        workers: &[(u64, usize, usize)],
+        pool_taints: &HashMap<u64, Arc<HashSet<String>>>,
+        allowed: Option<Vec<u64>>,
+        shared: Option<&SharedColdIds>,
+        shared_cache_blocks: Option<u32>,
+        prefill_tokens: &HashMap<u64, usize>,
+        dp_sizes: &HashMap<u64, u32>,
+    ) -> Result<WorkerWithDpRank, dynamo_kv_router::scheduling::KvSchedulerError> {
         let mut request = SchedulingRequest {
             mode: ScheduleMode::QueryOnly { request_id: None },
             token_seq: None,
@@ -930,25 +984,23 @@ mod tests {
                 active_request_weight: KvRouterConfig::default()
                     .decode_active_request_weight
                     .max(MIN_ACTIVE_REQUEST_BLOCKS),
+                spillover_capacity_tokens: parameters
+                    .spillover_capacity_tokens
+                    .or(config.active_prefill_tokens_threshold.map(|t| t as usize)),
             },
             seen_cold_ids: std::cell::RefCell::new(
                 shared.map(|rc| rc.borrow().clone()).unwrap_or_default(),
             ),
         };
 
-        WorkerSelectionPolicy::new(
-            KvRouterConfig::default(),
-            "test",
-            Vec::new(),
-            Box::new(picker),
-        )
-        .select_worker(WorkerSelectionInput::configured(
-            &configs,
-            &request,
-            request.eligibility(),
-            BLOCK_SIZE,
-        ))
-        .map(|outcome| outcome.worker)
+        WorkerSelectionPolicy::new(config.clone(), "test", Vec::new(), Box::new(picker))
+            .select_worker(WorkerSelectionInput::configured(
+                &configs,
+                &request,
+                request.eligibility(),
+                BLOCK_SIZE,
+            ))
+            .map(|outcome| outcome.worker)
     }
 
     /// Two tiers over effective prefill: [100, 160) on taint cold-1, [160, ∞) on cold-2.
@@ -1407,7 +1459,9 @@ mod tests {
             &HashMap::from([(A, 4)]),
         )
         .unwrap();
-        assert_eq!(selected, worker(A));
+        // DP4 contributes four candidate rows; any of the four rank rows is a valid
+        // escape target.
+        assert_eq!(selected.worker_id, A);
 
         // The same pool loaded past the ceiling — 80_000 per rank, utilization 0.8 —
         // denies the escape at any data-parallel width.
@@ -1427,8 +1481,10 @@ mod tests {
 
     #[test]
     fn spillover_utilization_parameters_are_validated() {
-        // utilization out of range / capacity non-positive / capacity without
-        // utilization are all startup errors.
+        // utilization out of range / capacity non-positive are startup errors.
+        // Capacity-without-utilization is no longer one: the capacity may come from
+        // the inherited DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD, so the pairing is
+        // resolved against the config at factory time, not here.
         assert!(
             Parameters {
                 spillover_max_cold_utilization: Some(1.5),
@@ -1459,10 +1515,23 @@ mod tests {
         assert!(
             Parameters {
                 spillover_capacity_tokens: Some(100_000),
+                compute_workers: Some(1),
                 ..Parameters::default()
             }
             .validate()
-            .is_err()
+            .is_ok()
+        );
+        // utilization without any capacity source is a factory-time error (the
+        // capacity may still arrive via the inherited draining threshold), not a
+        // parameter-shape error.
+        assert!(
+            Parameters {
+                spillover_max_cold_utilization: Some(0.6),
+                compute_workers: Some(1),
+                ..Parameters::default()
+            }
+            .validate()
+            .is_ok()
         );
         assert!(
             Parameters {
@@ -1474,6 +1543,70 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+
+    #[test]
+    fn spillover_capacity_defaults_to_draining_threshold() {
+        // Inheritance: spillover_capacity_tokens unset, so the gate inherits the
+        // router's draining level (DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD) as the
+        // per-rank capacity. One cold member at 120_000 of a 200_000 inherited
+        // capacity is 0.6 — the inclusive boundary allows the escape.
+        let pool_taints = HashMap::from([(A, taint_set(&["cold-1"]))]);
+        let params = Parameters {
+            allow_warm_spillover: true,
+            spillover_max_cold_utilization: Some(0.6),
+            // spillover_capacity_tokens: deliberately unset
+            ..two_tier_params()
+        };
+        let config = KvRouterConfig {
+            active_prefill_tokens_threshold: Some(200_000),
+            ..KvRouterConfig::default()
+        };
+        let selected = select_result_with_config(
+            &config,
+            &params,
+            80,
+            &[(A, 0, 0), (B, 0, 6)],
+            &pool_taints,
+            Some(vec![A]),
+            None,
+            None,
+            &HashMap::from([(A, 120_000)]),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(selected, worker(A));
+    }
+
+    #[test]
+    fn spillover_capacity_explicit_overrides_inherited() {
+        // Explicit wins over the inherited draining level: with capacity 100_000
+        // configured and the inherited 200_000 ignored, the same 120_000 load reads
+        // as 1.2 and denies the escape.
+        let pool_taints = HashMap::from([(A, taint_set(&["cold-1"]))]);
+        let params = Parameters {
+            allow_warm_spillover: true,
+            spillover_max_cold_utilization: Some(0.6),
+            spillover_capacity_tokens: Some(100_000),
+            ..two_tier_params()
+        };
+        let config = KvRouterConfig {
+            active_prefill_tokens_threshold: Some(200_000),
+            ..KvRouterConfig::default()
+        };
+        let result = select_result_with_config(
+            &config,
+            &params,
+            80,
+            &[(A, 0, 0), (B, 0, 6)],
+            &pool_taints,
+            Some(vec![A]),
+            None,
+            None,
+            &HashMap::from([(A, 120_000)]),
+            &HashMap::new(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

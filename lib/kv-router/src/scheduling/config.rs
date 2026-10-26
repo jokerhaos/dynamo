@@ -302,6 +302,11 @@ fn kv_router_config_from_lookup(
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_TEMPERATURE") {
         config.router_temperature = value;
     }
+    if let Some(value) = get_env("DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD")
+        && let Ok(threshold) = value.trim().parse::<u64>()
+    {
+        config.active_prefill_tokens_threshold = Some(threshold);
+    }
     // Read the canonical name first, then the Rust-only alias for backward compatibility.
     let use_kv_events = parse_bool(&get_env, "DYN_ROUTER_USE_KV_EVENTS")
         .or_else(|| parse_bool(&get_env, "DYN_USE_KV_EVENTS"));
@@ -824,6 +829,15 @@ pub struct KvRouterConfig {
 
     pub router_temperature: f64,
 
+    /// Worker draining level for active prefill tokens, read from
+    /// `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` — the same level the worker monitor's
+    /// overload detection drains workers at. Shared so worker-selection policies can
+    /// anchor capacity semantics to the draining level (for example treating a pool
+    /// fully at the draining level as 100% utilized) without a second hand-synced
+    /// copy of the number. `None` when the env var is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_prefill_tokens_threshold: Option<u64>,
+
     pub use_kv_events: bool,
 
     pub router_replica_sync: bool,
@@ -1006,6 +1020,7 @@ impl Default for KvRouterConfig {
             host_cache_hit_weight: default_host_cache_hit_weight(),
             disk_cache_hit_weight: default_disk_cache_hit_weight(),
             router_temperature: 0.0,
+            active_prefill_tokens_threshold: None,
             use_kv_events: true,
             router_replica_sync: false,
             router_track_active_blocks: true,
@@ -1071,6 +1086,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             host_cache_hit_weight: compat.host_cache_hit_weight,
             disk_cache_hit_weight: compat.disk_cache_hit_weight,
             router_temperature: compat.router_temperature,
+            active_prefill_tokens_threshold: None,
             use_kv_events: compat.use_kv_events,
             router_replica_sync: compat.router_replica_sync,
             router_track_active_blocks: compat.router_track_active_blocks,
@@ -1794,6 +1810,7 @@ mod tests {
             ("DYN_ROUTER_PREFILL_LOAD_SCALE", "2.5"),
             ("DYN_ROUTER_DECODE_ACTIVE_REQUEST_WEIGHT", "32"),
             ("DYN_ROUTER_TEMPERATURE", "0.7"),
+            ("DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD", "198000"),
             ("DYN_ROUTER_USE_KV_EVENTS", "false"),
             ("DYN_ROUTER_REPLICA_SYNC", "yes"),
             ("DYN_ROUTER_TRACK_ACTIVE_BLOCKS", "0"),
@@ -1828,6 +1845,7 @@ mod tests {
         assert_eq!(config.router_decode_policy.as_deref(), Some("decode-cli"));
         assert_eq!(config.decode_active_request_weight, 32.0);
         assert_eq!(config.router_temperature, 0.7);
+        assert_eq!(config.active_prefill_tokens_threshold, Some(198_000));
         assert!(!config.use_kv_events);
         assert!(config.router_replica_sync);
         assert!(!config.router_track_active_blocks);

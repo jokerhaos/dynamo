@@ -222,6 +222,7 @@ impl KvRouterConfig {
             enable_session_prefix_index,
             shared_cache_multiplier,
             shared_cache_type: shared_cache_type.parse().map_err(PyValueError::new_err)?,
+            active_prefill_tokens_threshold: None,
             conditional_disagg_enabled,
             conditional_disagg_policy: conditional_disagg_policy
                 .parse::<RsConditionalDisaggPolicyKind>()

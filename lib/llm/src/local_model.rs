@@ -495,9 +495,14 @@ pub async fn register_model_card(
         endpoint.component().name().to_string(),
         endpoint.name().to_string(),
         &wire_card,
-        model_suffix,
+        model_suffix.clone(),
     )?;
-    let _instance = discovery.register(spec).await?;
+    // Under worker validation the discovery write may be held until release.
+    if let Some(spec) =
+        crate::validation_hold::hold_card(endpoint, model_suffix.as_deref(), spec).await
+    {
+        discovery.register(spec).await?;
+    }
 
     // Size the process-global admission gate from this card, after registration
     // succeeds. LoRA adapters carry no capacity of their own.
@@ -515,6 +520,7 @@ pub async fn update_model_taints(
     endpoint: &Endpoint,
     taints: HashSet<String>,
 ) -> anyhow::Result<()> {
+    crate::validation_hold::reject_if_held(endpoint).await?;
     let endpoint_id = endpoint.id();
     let instance_id = endpoint.drt().connection_id();
     let discovery = endpoint.drt().discovery();
@@ -683,6 +689,10 @@ impl LocalModel {
         self.card.worker_type = worker_type;
         self.card.needs = needs;
         self.card.lora = lora_info.clone();
+
+        // Before the card's files are rewritten to URLs below: the validation
+        // endpoint loads the tokenizer and templates from local paths.
+        crate::entrypoint::input::local_openai::serve_if_gated(endpoint, &self.card).await?;
 
         let lora_name = self.card.lora.as_ref().map(|info| info.name.as_str());
         let model_suffix = derive_lora_suffix(lora_name);
@@ -862,8 +872,10 @@ impl LocalModel {
             model_suffix,
         };
 
-        let discovery = drt.discovery();
-        discovery.unregister(instance).await?;
+        // A card held by worker validation was never written.
+        if !crate::validation_hold::forget_held(endpoint, registry_owner.1.as_deref()).await {
+            drt.discovery().unregister(instance).await?;
+        }
         drt.metadata_artifacts()
             .unregister_for_owner(&registry_owner);
 

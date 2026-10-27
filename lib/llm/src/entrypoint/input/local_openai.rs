@@ -90,9 +90,18 @@ pub async fn serve_if_gated(endpoint: &Endpoint, card: &ModelDeploymentCard) -> 
 }
 
 /// A base model that takes tokens and has a chat or completions surface.
+///
+/// The legacy `ModelType::Prefill` marker bit also counts: disaggregated
+/// prefill workers advertise no OpenAI surface by design (the role is carried
+/// by `worker_type`), yet their generate endpoint is fully registered locally,
+/// which is all [`RegistryEngine`] needs to serve a completion through the
+/// frontend pipeline. Without this, a gated prefill worker never gets a
+/// `base_url`, its checks fail, and the card stays held forever.
 fn servable(card: &ModelDeploymentCard) -> bool {
     card.model_input == ModelInput::Tokens
-        && (card.model_type.supports_chat() || card.model_type.supports_completions())
+        && (card.model_type.supports_chat()
+            || card.model_type.supports_completions()
+            || card.model_type.supports_prefill())
         && card.lora.is_none()
 }
 
@@ -281,8 +290,8 @@ mod tests {
             .component("c")
             .unwrap()
             .endpoint("generate");
-        // A prefill worker's card: tokens in, no chat or completions surface.
-        let mut card = ModelDeploymentCard::with_name_only("prefill");
+        // A card with no surface at all and no prefill bit: not servable.
+        let mut card = ModelDeploymentCard::with_name_only("not-servable");
         card.model_input = ModelInput::Tokens;
         card.model_type = ModelType::empty();
 
@@ -298,5 +307,66 @@ mod tests {
         .unwrap_or_else(|_| panic!("{}", validation.status_json()));
         let (_, body) = &checks.requests()[0];
         assert_eq!(*body, serde_json::json!({"base_url": null}));
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test]
+    async fn a_prefill_marker_card_serves_the_validation_endpoint() {
+        use crate::model_type::ModelType;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+        let checks = dynamo_runtime::validation::testing::CheckServer::start().await;
+        let gate = checks.url("pass");
+        let drt = temp_env::async_with_vars(
+            [
+                ("DYN_SYSTEM_PORT", Some("0")),
+                ("DYN_PUBLISH_GATE", Some(gate.as_str())),
+            ],
+            async {
+                DistributedRuntime::new(
+                    Runtime::from_current().unwrap(),
+                    DistributedConfig::process_local(),
+                )
+                .await
+                .unwrap()
+            },
+        )
+        .await;
+        let endpoint = drt
+            .namespace("ns")
+            .unwrap()
+            .component("c")
+            .unwrap()
+            .endpoint("generate");
+        // A disaggregated prefill worker's card: tokens in, a real tokenizer
+        // (a prefill worker carries the model's tokenizer), no OpenAI surface,
+        // only the legacy Prefill marker bit. It must still get a base_url so
+        // its gates can send it a completion.
+        let mut card = ModelDeploymentCard::load_from_disk(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/sample-models/TinyLlama_v1.1"
+            ),
+            None,
+        )
+        .unwrap();
+        card.model_input = ModelInput::Tokens;
+        card.model_type = ModelType::Prefill;
+
+        serve_if_gated(&endpoint, &card).await.unwrap();
+        drt.local_endpoint_registry()
+            .register("generate".into(), JsonEngine::local(Arc::new(EchoTokens)));
+        let validation = drt.worker_validation().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            validation.wait_released(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{}", validation.status_json()));
+        let (_, body) = &checks.requests()[0];
+        assert!(
+            body.get("base_url").and_then(|u| u.as_str()).is_some(),
+            "prefill-marker card must pass a base_url to its checks, got {body}"
+        );
     }
 }

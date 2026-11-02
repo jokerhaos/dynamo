@@ -24,6 +24,7 @@ from dynamo.sglang.engine_generate import (
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
 from dynamo.sglang.request_handlers.llm.decode_handler import (
+    _engine_validation_stream,
     _kv_cache_hit_engine_data,
     _native_payload_is_batched,
     _ordered_cancellation_request_id,
@@ -226,7 +227,9 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 supported=getattr(self, "_supports_ordered_cancellation", False),
                 batched=native_payload_is_batched,
             )
-            results = native_generate_stream(self.engine, native_request)
+            results = _engine_validation_stream(
+                native_generate_stream(self.engine, native_request)
+            )
         else:
             submitted_request_id = _ordered_cancellation_request_id(
                 sglang_request_id,
@@ -240,27 +243,29 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 {"logprobs": output_options.get("logprobs")},
                 allow_top_logprobs=_shared_logprobs.sglang_top_logprobs_allowed(),
             )
-            results = await self.engine.async_generate(
-                **input_param,
-                **logprob_kwargs,
-                **mm_kwargs,
-                **cache_salt_kwargs(self.engine, request_cache_salt(inner_request)),
-                sampling_params=sampling_params,
-                stream=True,
-                **require_reasoning_kwargs(
-                    self.engine,
-                    inner_request,
-                    thinking_budget_requested=has_thinking_budget,
-                ),
-                bootstrap_host=bootstrap_host,
-                bootstrap_port=bootstrap_port,
-                bootstrap_room=bootstrap_room,
-                external_trace_header=trace_header,
-                rid=sglang_request_id,
-                data_parallel_rank=dp_rank,
-                lora_path=lora_path,
-                **priority_kwargs,
-                **agent_session_kwargs(self.engine, inner_request),
+            results = _engine_validation_stream(
+                await self.engine.async_generate(
+                    **input_param,
+                    **logprob_kwargs,
+                    **mm_kwargs,
+                    **cache_salt_kwargs(self.engine, request_cache_salt(inner_request)),
+                    sampling_params=sampling_params,
+                    stream=True,
+                    **require_reasoning_kwargs(
+                        self.engine,
+                        inner_request,
+                        thinking_budget_requested=has_thinking_budget,
+                    ),
+                    bootstrap_host=bootstrap_host,
+                    bootstrap_port=bootstrap_port,
+                    bootstrap_room=bootstrap_room,
+                    external_trace_header=trace_header,
+                    rid=sglang_request_id,
+                    data_parallel_rank=dp_rank,
+                    lora_path=lora_path,
+                    **priority_kwargs,
+                    **agent_session_kwargs(self.engine, inner_request),
+                )
             )
         if inner_request.get(HEALTH_CHECK_KEY):
             # Canary: stream engine output so the Rust canary sees scheduler output.
